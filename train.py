@@ -18,6 +18,7 @@ from tqdm import tqdm
 from datasets import load_from_disk
 import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
+from jax.experimental.multihost_utils import sync_global_devices
 
 def calculate_metrics(logits, labels, mask):
     """Calculate loss, accuracy, and perplexity metrics."""
@@ -410,6 +411,8 @@ def main():
     train_dataset, test_dataset = load_dataset()
 
     jax.distributed.initialize()
+    print(f"Process {jax.process_index()}: Initialized distributed runtime")
+    sync_global_devices("distributed_init")
 
     mesh = make_mesh()
     data_spec = NS(mesh, PS('data', None))
@@ -417,6 +420,8 @@ def main():
     # Create batch loaders
     train_loader = BatchLoader(dataset=train_dataset, batch_size=BATCH_SIZE, data_spec=data_spec)
     test_loader = BatchLoader(dataset=test_dataset, batch_size=BATCH_SIZE, data_spec=data_spec, seed=43)
+    print(f"Process {jax.process_index()}: Created data loaders")
+    sync_global_devices("data_loaders_created")
 
     # Create checkpoint manager
     ckpt_manager = create_checkpoint_manager(CHECKPOINT_DIR)
@@ -430,19 +435,20 @@ def main():
     with mesh:
         # Create model
         model = create_sharded_model()
+        print(f"Process {jax.process_index()}: Created sharded model")
+        sync_global_devices("model_created")
         
         # Print model size
         print(f"\nModel Parameters: {count_params(model):.2f}B")
         print("-" * 50)
 
-        # Create learning rate schedule
+        # Create learning rate schedule and optimizer
         lr_schedule = create_learning_rate_schedule(
             total_steps=total_steps,
             warmup_steps=warmup_steps,
             base_lr=LEARNING_RATE
         )
 
-        # Create optimizer
         optimizer = nnx.Optimizer(
             model,
             optax.chain(
@@ -456,14 +462,18 @@ def main():
                 )
             )
         )
+        print(f"Process {jax.process_index()}: Created optimizer")
+        sync_global_devices("optimizer_created")
         
         # Try to restore from checkpoint
         start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
+        print(f"Process {jax.process_index()}: Restored checkpoint state")
+        sync_global_devices("checkpoint_restored")
         
         # Initialize best eval loss from checkpoint metrics or default
         best_eval_loss = metrics.get("best_eval_loss", float('inf'))
         if start_step > 0:
-            print(f"Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
+            print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
         
         # Create metrics tracker
         train_metrics = nnx.MultiMetric(
@@ -511,13 +521,13 @@ def main():
                 eval_loss = eval_results['loss']
                 
                 # Print eval results
-                print(f"\nEval at step {step+1}: " + 
+                print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
                       " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
                 
                 # Track best model
                 if eval_loss < best_eval_loss:
                     best_eval_loss = eval_loss
-                    print(f"New best eval loss: {best_eval_loss:.4f}")
+                    print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
                 
                 # Save checkpoint with metrics
                 metrics = {
