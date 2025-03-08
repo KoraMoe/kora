@@ -111,7 +111,9 @@ def load_dataset():
     split = dataset.train_test_split( # type: ignore
         test_size=test_size,
         shuffle=True,
-        seed=42
+        seed=42,
+        keep_in_memory=True,
+        load_from_cache_file=False,
     )
     
     train_dataset = split['train']
