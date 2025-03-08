@@ -102,7 +102,7 @@ def eval_step(model: Transformer, metrics: nnx.MultiMetric, batch):
     )
 
 def make_mesh():
-    mesh = jax.make_mesh(MESH_SHAPE, ("data", "model", "head", "expert"))
+    mesh = jax.make_mesh(MESH_SHAPE, ("expert", "data"))
     return mesh
 
 def load_dataset():

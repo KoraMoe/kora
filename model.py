@@ -9,7 +9,7 @@ def _apply_causal_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.n
     # Create causal mask (including self-attention)
     row_idx = jnp.arange(seq_len)[None, :]
     col_idx = jnp.arange(seq_len)[:, None]
-    causal_mask = row_idx >= col_idx
+    causal_mask = row_idx <= col_idx
     
     # If attention mask is provided, combine with causal mask
     if attn_mask is not None:
@@ -118,18 +118,18 @@ class MultiHeadAttention(nnx.Module):
 
         self.in_proj = nnx.Param(
             init_fn(key, (3, self.d_model, self.num_heads, self.head_dim)),
-            sharding=(None, 'model', 'head', None),
+            sharding=(None, None, None, None),
             dtype=self.dtype,
         )
 
         self.out_proj = nnx.Param(
             init_fn(key, (self.num_heads, self.head_dim, self.d_model)),
-            sharding=('head', None, 'model'),
+            sharding=(None, None, None),
             dtype=self.dtype,
         )
 
     def _compute_qkv(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value)
+        qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value) # reduce
         q, k, v = qkv
 
         q, k = self.rotary.rotate_queries_and_keys(q, k)
@@ -183,7 +183,7 @@ class FeedForward(nnx.Module):
         # Input projection weights and bias
         self.keys = nnx.Param(
             init_fn(key, (self.num_experts, self.d_model, self.hidden_dim)),
-            sharding=('expert', 'model', None),
+            sharding=('expert', None, None),
             dtype=self.dtype,
         )
         self.key_bias = nnx.Param(
@@ -195,7 +195,7 @@ class FeedForward(nnx.Module):
         # Output projection weights and bias
         self.values = nnx.Param(
             init_fn(key, (self.num_experts, self.hidden_dim, self.d_model)),
-            sharding=('expert', None, 'model'),
+            sharding=('expert', None, None),
             dtype=self.dtype,
         )
         self.value_bias = nnx.Param(
@@ -232,12 +232,13 @@ class FeedForward(nnx.Module):
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         # Input projection with bias
-        hidden = jnp.einsum('bsed,edh->bseh', x, self.keys.value)
+
+        hidden = jnp.einsum('bsed,edh->bseh', x, self.keys.value) # reduce
         hidden = hidden + self.key_bias[None, None, :, :]  # Add bias to each expert
         hidden = self.act(hidden)
         
         # Output projection with bias
-        output = jnp.einsum('bseh,ehd->bsed', hidden, self.values.value)
+        output = jnp.einsum('bseh,ehd->bsed', hidden, self.values.value) # reduce
         output = output + self.value_bias[None, None, :, :]  # Add bias to each expert
         
         return output
@@ -270,12 +271,12 @@ class Router(nnx.Module):
         # Replace direct parameter with linear layer including bias
         self.gate_weight = nnx.Param(
             init_fn(key, (self.d_model, self.num_experts)),
-            sharding=('model', 'expert'),
+            sharding=(None, None),
             dtype=self.dtype,
         )
         self.gate_bias = nnx.Param(
             jnp.zeros((self.num_experts,)),
-            sharding=('expert',),
+            sharding=(None,),
             dtype=self.dtype,
         )
 
@@ -711,7 +712,7 @@ class Transformer(nnx.Module):
         # Token embeddings
         self.token_embedding = nnx.Param(
             init_fn(embedding_key, (self.vocab_size, self.d_model)),
-            sharding=(None, 'model'),
+            sharding=(None, None),
             dtype=self.dtype,
         )
         
@@ -745,7 +746,7 @@ class Transformer(nnx.Module):
         # Output projection
         self.lm_head = nnx.Param(
             init_fn(output_key, (self.d_model, self.vocab_size)),
-            sharding=('model', None),
+            sharding=(None, None),
             dtype=self.dtype,
         )
         
