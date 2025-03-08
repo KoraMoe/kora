@@ -11,5 +11,6 @@ dependencies = [
     "optax>=0.2.4",
     "orbax>=0.1.9",
     "transformers>=4.49.0",
-    "libtpu>=0.0.10.1; sys_platform != 'darwin'"
+    "libtpu>=0.0.10.1; sys_platform != 'darwin'",
+    "matplotlib>=3.10.1",
 ]

@@ -6,14 +6,11 @@ from functools import partial
 @partial(nnx.vmap, in_axes=(0, None, 0))
 @partial(nnx.vmap, in_axes=(0, None, None))
 def _apply_causal_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
-    # Create causal mask (including self-attention)
     row_idx = jnp.arange(seq_len)[None, :]
     col_idx = jnp.arange(seq_len)[:, None]
     causal_mask = row_idx <= col_idx
     
-    # If attention mask is provided, combine with causal mask
     if attn_mask is not None:
-        # Ensure self-attention is always possible by adding diagonal
         mask = jnp.logical_and(
             causal_mask,
             jnp.logical_or(attn_mask[:, None] > 0, jnp.eye(seq_len, dtype=bool))
@@ -812,8 +809,8 @@ class Test():
 
     @staticmethod
     @nnx.jit
-    def test_mha(module, x):
-        return module(x)
+    def test_mha(module, x, attn_mask):
+        return module(x, attn_mask)
 
     @staticmethod
     @nnx.jit
@@ -842,8 +839,10 @@ class Test():
         
         # Test MHA
         x_mha = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+        attn_mask = jnp.ones((self.batch_size, self.seq_len))
+        attn_mask = attn_mask.at[:, self.seq_len - 4:].set(0)
         try:
-            y = self.test_mha(self.mha, x_mha)
+            y = self.test_mha(self.mha, x_mha, attn_mask)
             print("MHA output shape:", y.shape)
             results['MHA'] = 'SUCCESS'
         except Exception as e:
