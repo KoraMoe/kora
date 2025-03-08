@@ -159,7 +159,6 @@ class BatchLoader:
         self.data_spec = data_spec
         # Use the same seed for all processes
         self.base_seed = seed
-        self.rng = np.random.RandomState(self.base_seed)
         self.num_prefetch = num_prefetch
         
         # Thread-safe queue for prefetched batches
@@ -174,7 +173,7 @@ class BatchLoader:
         self.current_epoch = 0
         self.current_idx = 0
         # Initial shuffle with base seed
-        self.indices = self.rng.permutation(self.num_samples)
+        self.indices = np.random.RandomState(seed=self.base_seed).permutation(self.num_samples)
         
         # Control flags
         self._stop_prefetching = threading.Event()
@@ -187,8 +186,7 @@ class BatchLoader:
         with self._lock:
             # Set the same seed for all processes based on the epoch
             epoch_seed = self.base_seed + self.current_epoch
-            self.rng.seed(epoch_seed)
-            self.indices = self.rng.permutation(self.num_samples)
+            self.indices = np.random.RandomState(seed=epoch_seed).permutation(self.num_samples)
             self.current_idx = 0
             self.current_epoch += 1
     
@@ -396,9 +394,8 @@ def load_checkpoint(
                     indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
                     batch_loader.indices = indices
                 else:
-                    # If indices are empty or invalid, reinitialize them
-                    batch_loader.indices = batch_loader.rng.permutation(batch_loader.num_samples)
-            
+                    batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+
             # Restart the prefetch worker to ensure it's in a good state
             batch_loader.restart_worker()
         except Exception as e:
@@ -408,7 +405,7 @@ def load_checkpoint(
             with batch_loader._lock:
                 batch_loader.current_epoch = 0
                 batch_loader.current_idx = 0
-                batch_loader.indices = batch_loader.rng.permutation(batch_loader.num_samples)
+                batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             batch_loader.restart_worker()
     
     return restored["step"], restored.get("metrics", {})
