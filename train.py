@@ -20,6 +20,10 @@ import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 
+def block_all(xs):
+    jax.tree_util.tree_map(lambda x: x.block_until_ready(), xs)
+    return xs
+
 def calculate_metrics(logits, labels, mask):
     """Calculate loss, accuracy, and perplexity metrics."""
     shift_logits = logits[..., :-1, :].astype(jnp.float32)
@@ -443,6 +447,11 @@ def main():
         progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
         for step in range(start_step, total_steps):
             batch = train_loader.next()
+
+            if step == 10:
+                with jax.profiler.trace("train_step", create_perfetto_trace=True):
+                    block_all(train_step(model, optimizer, train_metrics, batch))
+            
             train_step(model, optimizer, train_metrics, batch)
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
