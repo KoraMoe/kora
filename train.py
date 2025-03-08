@@ -409,6 +409,8 @@ def load_checkpoint(
 def main():
     train_dataset, test_dataset = load_dataset()
 
+    jax.distributed.initialize()
+
     mesh = make_mesh()
     data_spec = NS(mesh, PS('data', None))
 
