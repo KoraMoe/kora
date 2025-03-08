@@ -104,20 +104,17 @@ def load_dataset():
     # Load the tokenized dataset
     dataset = load_from_disk(TOKENIZED_DATASET_PATH)
 
-    # Take the last batch as test set
+    # Use indices to create test set
+    dataset_size = len(dataset)  # type: ignore
     test_size = BATCH_SIZE
     
-    # Split the dataset using train_test_split
-    split = dataset.train_test_split( # type: ignore
-        test_size=test_size,
-        shuffle=True,
-        seed=42,
-        keep_in_memory=True,
-        load_from_cache_file=False,
-    )
+    all_indices = list(range(dataset_size))
+    test_indices = all_indices[-test_size:]
+    train_indices = all_indices[:-test_size]
     
-    train_dataset = split['train']
-    test_dataset = split['test']
+    # Split using the indices
+    train_dataset = dataset.select(train_indices)  # type: ignore
+    test_dataset = dataset.select(test_indices)  # type: ignore
     
     return train_dataset, test_dataset
 
