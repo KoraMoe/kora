@@ -501,33 +501,9 @@ def main():
             if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
                 # Evaluate
                 eval_metrics.reset()
-                eval_failures = 0
-                max_eval_retries = 3
-                
-                # Make sure test_loader is in a good state before evaluation
-                try:
-                    test_loader.restart_worker()
-                except:
-                    pass
-                
-                for i in range(test_loader.steps_per_epoch):
-                    try:
-                        batch = test_loader.next()
-                        eval_step(model, eval_metrics, batch)
-                    except Exception as e:
-                        eval_failures += 1
-                        print(f"Evaluation batch {i} failed: {str(e)}")
-                        
-                        if eval_failures >= max_eval_retries:
-                            print(f"Too many evaluation failures ({eval_failures}), skipping remaining evaluation")
-                            break
-                        
-                        # Try to restart the worker and continue
-                        try:
-                            test_loader.restart_worker()
-                            time.sleep(0.5)  # Give it time to start
-                        except:
-                            pass
+                for _ in range(test_loader.steps_per_epoch):
+                    batch = test_loader.next()
+                    eval_step(model, eval_metrics, batch)
                 
                 eval_results = eval_metrics.compute()
                 eval_loss = eval_results['loss']
