@@ -157,7 +157,9 @@ class BatchLoader:
         self.dataset = dataset
         self.batch_size = batch_size
         self.data_spec = data_spec
-        self.rng = np.random.RandomState(seed)
+        # Add process index to ensure all processes have same base seed
+        self.base_seed = seed
+        self.rng = np.random.RandomState(self.base_seed)
         self.num_prefetch = num_prefetch
         
         # Thread-safe queue for prefetched batches
@@ -171,7 +173,18 @@ class BatchLoader:
         self._lock = threading.Lock()
         self.current_epoch = 0
         self.current_idx = 0
-        self.indices = self.rng.permutation(self.num_samples)  # Initialize indices immediately
+        
+        # Ensure all processes start with the same shuffled indices
+        if jax.process_index() == 0:
+            # Only main process generates the initial indices
+            self.indices = self.rng.permutation(self.num_samples)
+        else:
+            # Other processes initialize with zeros and will sync
+            self.indices = np.zeros(self.num_samples, dtype=np.int32)
+        
+        # Synchronize initial indices across all processes
+        self.indices = jax.device_put_replicated(self.indices, jax.devices())
+        sync_global_devices("batch_loader_init")
         
         # Control flags
         self._stop_prefetching = threading.Event()
@@ -182,7 +195,21 @@ class BatchLoader:
     def _shuffle_indices(self):
         """Thread-safe shuffle of dataset indices."""
         with self._lock:
-            self.indices = self.rng.permutation(self.num_samples)
+            # Set the same seed for all processes based on the epoch
+            epoch_seed = self.base_seed + self.current_epoch
+            self.rng.seed(epoch_seed)
+            
+            if jax.process_index() == 0:
+                # Only main process generates the shuffled indices
+                self.indices = self.rng.permutation(self.num_samples)
+            else:
+                # Other processes initialize with zeros and will sync
+                self.indices = np.zeros(self.num_samples, dtype=np.int32)
+            
+            # Synchronize shuffled indices across all processes
+            self.indices = jax.device_put_replicated(self.indices, jax.devices())
+            sync_global_devices(f"shuffle_epoch_{self.current_epoch}")
+            
             self.current_idx = 0
             self.current_epoch += 1
     
