@@ -174,6 +174,7 @@ class BatchLoader:
         
         # Control flags
         self._stop_prefetching = threading.Event()
+        self._worker_error = None
         self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
         self._prefetch_thread.start()
     
@@ -197,7 +198,9 @@ class BatchLoader:
     def _create_batch(self, indices):
         """Create a sharded batch from indices."""
         examples = {}
-        batch_data = self.dataset[indices]
+        # Ensure indices are valid and within range
+        valid_indices = np.clip(indices, 0, len(self.dataset) - 1)
+        batch_data = self.dataset[valid_indices]
         
         for k, v in batch_data.items():
             array = jnp.array(v)
@@ -217,16 +220,52 @@ class BatchLoader:
                 
                 # Add to queue with timeout to allow checking stop flag
                 self._prefetch_queue.put(batch, timeout=1.0)
-            except:
-                # If queue is full or other error, sleep briefly
-                time.sleep(0.1)
+            except Exception as e:
+                # Store the error and exit
+                self._worker_error = e
+                print(f"Error in prefetch worker: {str(e)}")
+                break
+    
+    def restart_worker(self):
+        """Restart the prefetch worker thread if it died."""
+        if hasattr(self, '_prefetch_thread') and not self._prefetch_thread.is_alive():
+            # Clear the queue
+            while not self._prefetch_queue.empty():
+                try:
+                    self._prefetch_queue.get_nowait()
+                except:
+                    pass
+            
+            # Reset error state
+            self._worker_error = None
+            
+            # Start a new thread
+            self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
+            self._prefetch_thread.start()
+            
+            # Give the thread time to start
+            time.sleep(0.1)
     
     def next(self):
         """Get next batch from the prefetch queue."""
+        # Check if worker is alive, if not restart it
+        if hasattr(self, '_prefetch_thread') and not self._prefetch_thread.is_alive():
+            self.restart_worker()
+        
         try:
             return self._prefetch_queue.get(timeout=10.0)
-        except:
-            raise RuntimeError("Timeout waiting for next batch. Prefetching thread may have died.")
+        except Exception as e:
+            # Try to restart the worker if it's dead
+            self.restart_worker()
+            try:
+                # Try one more time
+                return self._prefetch_queue.get(timeout=10.0)
+            except:
+                if self._worker_error:
+                    error_msg = f"Prefetching thread encountered an error: {str(self._worker_error)}"
+                else:
+                    error_msg = "Timeout waiting for next batch. Prefetching thread may have died."
+                raise RuntimeError(error_msg)
     
     def __del__(self):
         """Cleanup method to stop background thread."""
@@ -337,12 +376,33 @@ def load_checkpoint(
     
     # Restore batch loader state if provided
     if batch_loader is not None:
-        batch_state = restored["batch_state"]
-        with batch_loader._lock:
-            batch_loader.current_epoch = batch_state["current_epoch"]
-            batch_loader.current_idx = batch_state["current_idx"]
-            # Convert to numpy array first to ensure compatibility
-            batch_loader.indices = np.array(batch_state["indices"])
+        try:
+            batch_state = restored["batch_state"]
+            with batch_loader._lock:
+                batch_loader.current_epoch = batch_state["current_epoch"]
+                batch_loader.current_idx = batch_state["current_idx"]
+                
+                # Handle potential issues with indices
+                indices = batch_state["indices"]
+                if len(indices) > 0:
+                    # Ensure indices are within the valid range for the dataset
+                    indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
+                    batch_loader.indices = indices
+                else:
+                    # If indices are empty or invalid, reinitialize them
+                    batch_loader.indices = batch_loader.rng.permutation(batch_loader.num_samples)
+            
+            # Restart the prefetch worker to ensure it's in a good state
+            batch_loader.restart_worker()
+        except Exception as e:
+            print(f"Warning: Failed to restore batch loader state: {str(e)}")
+            print("Reinitializing batch loader...")
+            # Reset the batch loader to initial state
+            with batch_loader._lock:
+                batch_loader.current_epoch = 0
+                batch_loader.current_idx = 0
+                batch_loader.indices = batch_loader.rng.permutation(batch_loader.num_samples)
+            batch_loader.restart_worker()
     
     return restored["step"], restored.get("metrics", {})
 
@@ -441,9 +501,33 @@ def main():
             if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
                 # Evaluate
                 eval_metrics.reset()
-                for _ in range(test_loader.steps_per_epoch):
-                    batch = test_loader.next()
-                    eval_step(model, eval_metrics, batch)
+                eval_failures = 0
+                max_eval_retries = 3
+                
+                # Make sure test_loader is in a good state before evaluation
+                try:
+                    test_loader.restart_worker()
+                except:
+                    pass
+                
+                for i in range(test_loader.steps_per_epoch):
+                    try:
+                        batch = test_loader.next()
+                        eval_step(model, eval_metrics, batch)
+                    except Exception as e:
+                        eval_failures += 1
+                        print(f"Evaluation batch {i} failed: {str(e)}")
+                        
+                        if eval_failures >= max_eval_retries:
+                            print(f"Too many evaluation failures ({eval_failures}), skipping remaining evaluation")
+                            break
+                        
+                        # Try to restart the worker and continue
+                        try:
+                            test_loader.restart_worker()
+                            time.sleep(0.5)  # Give it time to start
+                        except:
+                            pass
                 
                 eval_results = eval_metrics.compute()
                 eval_loss = eval_results['loss']

@@ -440,6 +440,7 @@ dependencies = [
     { name = "datasets" },
     { name = "flax" },
     { name = "jax" },
+    { name = "libtpu", marker = "sys_platform != 'darwin'" },
     { name = "optax" },
     { name = "orbax" },
     { name = "transformers" },
@@ -450,9 +451,18 @@ requires-dist = [
     { name = "datasets", specifier = ">=3.3.2" },
     { name = "flax", specifier = ">=0.10.4" },
     { name = "jax", specifier = ">=0.5.2" },
+    { name = "libtpu", marker = "sys_platform != 'darwin'", specifier = "==0.0.10.1" },
     { name = "optax", specifier = ">=0.2.4" },
     { name = "orbax", specifier = ">=0.1.9" },
     { name = "transformers", specifier = ">=4.49.0" },
+]
+
+[[package]]
+name = "libtpu"
+version = "0.0.10.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/99/d05582e42de50bf9f1dc735074ffc793fa6b4edfbc771fbfdae969b123bf/libtpu-0.0.10.1-py3-none-manylinux_2_27_x86_64.whl", hash = "sha256:014b7947a7fb6d71c99ce6a817809b596a9bd6b2100f026d51db810b526d2ca6", size = 129677641 },
 ]
 
 [[package]]
