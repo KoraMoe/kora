@@ -1,0 +1,912 @@
+import jax
+import jax.numpy as jnp
+from flax import nnx
+from functools import partial
+
+@partial(nnx.vmap, in_axes=(0, None, 0))
+@partial(nnx.vmap, in_axes=(0, None, None))
+def _apply_causal_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+    # Create causal mask (including self-attention)
+    row_idx = jnp.arange(seq_len)[None, :]
+    col_idx = jnp.arange(seq_len)[:, None]
+    causal_mask = row_idx >= col_idx
+    
+    # If attention mask is provided, combine with causal mask
+    if attn_mask is not None:
+        # Ensure self-attention is always possible by adding diagonal
+        mask = jnp.logical_and(
+            causal_mask,
+            jnp.logical_or(attn_mask[:, None] > 0, jnp.eye(seq_len, dtype=bool))
+        )
+    else:
+        mask = causal_mask
+    
+    return jnp.where(mask, score_matrix, -1e9)
+
+class RMSNorm(nnx.Module):
+    def __init__(self, 
+        dim: int,
+        epsilon: float = 1e-6,
+        dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.dim = dim
+        self.epsilon = epsilon
+        self.dtype = dtype
+        
+        key = rngs.params()
+
+        self.scale = nnx.Param(
+            jax.random.normal(key, (dim,)),
+            sharding=(None,),
+            dtype=self.dtype,
+        )
+    
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Calculate RMS along last dimension
+        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+        x_norm = x * jax.lax.rsqrt(variance + self.epsilon)
+        
+        # Scale and return
+        return self.scale * x_norm
+
+class RotaryEmbedding(nnx.Module):
+    def __init__(self, 
+        dim: int, 
+        base: int = 10000,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+    ):
+        self.dim = dim
+        self.dtype = dtype
+        self.base = base
+        self.training = training
+    
+    def get_rotary_cache(self, seq_len: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+        inv_freq = 1.0 / (self.base ** (2 * jnp.arange(0, self.dim // 2) / self.dim))
+        positions = jnp.arange(seq_len, dtype=self.dtype)
+        angles = positions[:, None] * inv_freq[None, :]
+        cos = jnp.cos(angles)
+        sin = jnp.sin(angles)
+        return (
+            cos.reshape(1, seq_len, 1, cos.shape[-1]),
+            sin.reshape(1, seq_len, 1, sin.shape[-1])
+        )
+
+    def __call__(self, x: jnp.ndarray, seq_len: int | None = None) -> jnp.ndarray:
+        seq_len = seq_len if seq_len is not None else x.shape[1]
+        cos, sin = self.get_rotary_cache(seq_len)
+        x_reshaped = x.reshape(*x.shape[:-1], -1, 2)
+
+        x_out = jnp.concatenate([
+            x_reshaped[..., 0] * cos - x_reshaped[..., 1] * sin,
+            x_reshaped[..., 0] * sin + x_reshaped[..., 1] * cos
+        ], axis=-1)
+
+        return x_out.reshape(x.shape)
+
+    def rotate_queries_and_keys(self, q: jnp.ndarray, k: jnp.ndarray, seq_len: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        seq_len = seq_len if seq_len is not None else q.shape[1]
+        return self.__call__(q, seq_len), self.__call__(k, seq_len)
+
+class MultiHeadAttention(nnx.Module):
+    def __init__(self, 
+        num_heads: int, 
+        d_model: int,
+        head_dim: int,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.num_heads = num_heads
+        self.d_model = d_model
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.training = training
+        
+        key = rngs.params()
+        
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+
+        self.rotary = RotaryEmbedding(
+            dim=self.head_dim,
+            dtype=self.dtype,
+            training=self.training,
+        )
+
+        self.in_proj = nnx.Param(
+            init_fn(key, (3, self.d_model, self.num_heads, self.head_dim)),
+            sharding=(None, 'model', 'head', None),
+            dtype=self.dtype,
+        )
+
+        self.out_proj = nnx.Param(
+            init_fn(key, (self.num_heads, self.head_dim, self.d_model)),
+            sharding=('head', None, 'model'),
+            dtype=self.dtype,
+        )
+
+    def _compute_qkv(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value)
+        q, k, v = qkv
+
+        q, k = self.rotary.rotate_queries_and_keys(q, k)
+
+        q = jnp.einsum('bshd->bhsd', q)
+        k = jnp.einsum('bshd->bhsd', k)
+        v = jnp.einsum('bshd->bhsd', v)
+
+        return q, k, v
+    
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+        batch_size, seq_len, _ = x.shape
+
+        q, k, v = self._compute_qkv(x)
+
+        scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / jnp.sqrt(self.head_dim)
+        
+        # Handle both causal and attention masking in one step
+        if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
+            if attn_mask.shape[1] > seq_len:
+                attn_mask = attn_mask[:, :seq_len]
+        scores = _apply_causal_mask(scores, seq_len, attn_mask)
+
+        attn_weights = nnx.softmax(scores, axis=-1)
+
+        output = jnp.einsum('bnqk,bnkd,ndo->bqo', attn_weights, v, self.out_proj.value)
+
+        return output
+
+class FeedForward(nnx.Module):
+    def __init__(self, 
+        d_model: int,
+        hidden_dim: int,
+        num_experts: int = 1,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_experts = num_experts
+        self.dtype = dtype
+        self.training = training
+
+        key = rngs.params()
+        
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+        
+        # Input projection weights and bias
+        self.keys = nnx.Param(
+            init_fn(key, (self.num_experts, self.d_model, self.hidden_dim)),
+            sharding=('expert', 'model', None),
+            dtype=self.dtype,
+        )
+        self.key_bias = nnx.Param(
+            jnp.zeros((self.num_experts, self.hidden_dim)),
+            sharding=('expert', None),
+            dtype=self.dtype,
+        )
+
+        # Output projection weights and bias
+        self.values = nnx.Param(
+            init_fn(key, (self.num_experts, self.hidden_dim, self.d_model)),
+            sharding=('expert', None, 'model'),
+            dtype=self.dtype,
+        )
+        self.value_bias = nnx.Param(
+            jnp.zeros((self.num_experts, self.d_model)),
+            sharding=('expert', None),
+            dtype=self.dtype,
+        )
+
+        self.act = nnx.gelu
+    
+    def process_by_indices(self, x: jnp.ndarray, indices: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
+        # indices shape: (batch, seq, top_k)
+        selected_keys = self.keys.value[indices]
+        selected_values = self.values.value[indices]
+        selected_key_bias = self.key_bias.value[indices]  # [batch, seq, top_k, hidden_dim]
+        selected_value_bias = self.value_bias.value[indices]  # [batch, seq, top_k, d_model]
+        
+        # [batch, seq, d_model] @ [batch, seq, top_k, d_model, hidden_dim] -> [batch, seq, top_k, hidden_dim]
+        hidden = jnp.einsum('bsd,bskdh->bskh', x, selected_keys)
+        
+        # Add bias and apply activation
+        hidden = hidden + selected_key_bias
+        hidden = self.act(hidden)
+        
+        # [batch, seq, top_k, hidden_dim] @ [batch, seq, top_k, hidden_dim, d_model] * [batch, seq, top_k]
+        # -> [batch, seq, d_model]
+        output = jnp.einsum('bskh,bskhd,bsk->bsd', hidden, selected_values, weights)
+        
+        # Apply the bias to each expert output then weight and sum
+        weighted_bias = jnp.sum(selected_value_bias * jnp.expand_dims(weights, axis=-1), axis=2)
+        output = output + weighted_bias
+        
+        return output
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # Input projection with bias
+        hidden = jnp.einsum('bsed,edh->bseh', x, self.keys.value)
+        hidden = hidden + self.key_bias[None, None, :, :]  # Add bias to each expert
+        hidden = self.act(hidden)
+        
+        # Output projection with bias
+        output = jnp.einsum('bseh,ehd->bsed', hidden, self.values.value)
+        output = output + self.value_bias[None, None, :, :]  # Add bias to each expert
+        
+        return output
+
+class Router(nnx.Module):
+    def __init__(self, 
+        d_model: int,
+        num_experts: int,
+        z_loss_coef: float = 1e-3,
+        balance_loss_coef: float = 1e-4,
+        top_k: int = 2,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.num_experts = num_experts
+        self.z_loss_coef = z_loss_coef
+        self.balance_loss_coef = balance_loss_coef
+        self.top_k = top_k
+        self.dtype = dtype
+        self.training = training
+
+        key = rngs.params()
+
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+
+        # Replace direct parameter with linear layer including bias
+        self.gate_weight = nnx.Param(
+            init_fn(key, (self.d_model, self.num_experts)),
+            sharding=('model', 'expert'),
+            dtype=self.dtype,
+        )
+        self.gate_bias = nnx.Param(
+            jnp.zeros((self.num_experts,)),
+            sharding=('expert',),
+            dtype=self.dtype,
+        )
+
+    def load_balance_loss(self, gating_probs, combined_expert_mask):
+        return jnp.mean(
+            jnp.mean(gating_probs, axis=1) * jnp.mean(combined_expert_mask, axis=1)
+        ) * (jnp.mean(combined_expert_mask, axis=1).shape[-1] ** 2)
+    
+    def z_loss(self, gating_logits: jnp.ndarray) -> jnp.ndarray:
+        log_z = nnx.logsumexp(gating_logits, axis=-1)
+        z_loss = jnp.mean(log_z ** 2)
+        return z_loss
+
+    def __call__(self, x: jnp.ndarray, expert_capacity: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
+        # x shape: (groups, size, d_model)
+        gating_logits = jnp.einsum('gsd,de->gse', x, self.gate_weight.value)
+        gating_logits = gating_logits + self.gate_bias[None, None, :] 
+
+        gating_probs = nnx.softmax(gating_logits)
+        
+        # expert_gate shape: (groups, size, top_k)
+        # expert_index shape: (groups, size, top_k)
+        expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
+
+        if expert_capacity is None:
+            return expert_gate, expert_index, None
+
+        expert_mask = nnx.one_hot(expert_index, num_classes=self.num_experts)
+
+        combined_expert_mask = jnp.sum(expert_mask, axis=2)
+
+        if self.training:
+            router_z_loss = self.z_loss(gating_logits)
+            router_balance_loss = self.load_balance_loss(gating_probs, combined_expert_mask)
+            loss = router_balance_loss * self.balance_loss_coef + router_z_loss * self.z_loss_coef
+        else:
+            loss = None
+
+        position_in_expert = jnp.cumsum(expert_mask, axis=1) * expert_mask
+
+        valid_assignment = jnp.less(position_in_expert, expert_capacity)
+
+        expert_gate_valid = expert_gate[..., None] * valid_assignment.astype(expert_gate.dtype)
+
+        combine_tensor_per_assignment = (
+            expert_gate_valid[..., None] *
+            nnx.one_hot(position_in_expert, num_classes=expert_capacity)
+        )
+
+        combine_tensor = jnp.sum(combine_tensor_per_assignment, axis=2)
+
+        combine_tensor = combine_tensor[..., 1:]
+
+        dispatch_mask = combine_tensor.astype(bool)
+
+        return combine_tensor, dispatch_mask, loss
+
+class MixtureLayer(nnx.Module):
+    def __init__(self, 
+        d_model: int,
+        hidden_dim: int,
+        num_total_experts: int,
+        num_shared_experts: int,
+        top_k: int = 2, # theoretically top_k = capacity_factor
+        capacity_factor: float = 2.0,
+        min_expert_capacity: int = 8,
+        max_group_size: int = 4096,
+        router_z_loss_coef: float = 1e-3,
+        router_balance_loss_coef: float = 1e-4,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_total_experts = num_total_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.min_expert_capacity = min_expert_capacity
+        self.max_group_size = max_group_size
+        self.router_z_loss_coef = router_z_loss_coef
+        self.router_balance_loss_coef = router_balance_loss_coef
+        self.dtype = dtype
+        self.training = training
+
+        key = rngs.params()
+
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+
+        self.num_ff_experts = self.num_total_experts
+        assert self.num_ff_experts >= 0, "Total special experts exceeds num_experts"
+
+        self.router = Router(
+            d_model=self.d_model,
+            num_experts=self.num_total_experts,
+            z_loss_coef=self.router_z_loss_coef,
+            balance_loss_coef=self.router_balance_loss_coef,
+            top_k=self.top_k,
+            dtype=self.dtype,
+            training=self.training,
+            init_fn=init_fn,
+            rngs=rngs
+        )
+        
+        if self.num_ff_experts > 0:
+            self.feedforward_experts = FeedForward(
+                d_model=self.d_model,
+                hidden_dim=self.hidden_dim,
+                num_experts=self.num_ff_experts,
+                dtype=self.dtype,
+                training=self.training,
+                init_fn=init_fn,
+                rngs=rngs
+            )
+        
+        if self.num_shared_experts > 0:
+            self.shared_experts = FeedForward(
+                d_model=self.d_model,
+                hidden_dim=self.hidden_dim,
+                num_experts=self.num_shared_experts,
+                dtype=self.dtype,
+                training=self.training,
+                init_fn=init_fn,
+                rngs=rngs
+            )
+    
+    def _compute_group_size(self, batch_size, seq_len):
+        """
+        Compute the optimal group size and expert capacity for routing.
+        
+        Each token selects top_k experts, so the total expert assignments per group is 
+        (group_size * top_k). These assignments need to be distributed across num_experts,
+        so the average assignments per expert is (group_size * top_k) / num_experts.
+        We multiply by capacity_factor to overprovision and avoid dropped tokens.
+        """
+        # Convert batch_size and seq_len to integers for static computation
+        batch_size_int = int(batch_size)
+        seq_len_int = int(seq_len)
+        num_tokens = batch_size_int * seq_len_int
+        
+        # Calculate target group size more efficiently
+        # We aim for sqrt(tokens) as a heuristic balancing parallelism and communication
+        sqrt_tokens = int(num_tokens ** 0.5)
+        group_size = min(self.max_group_size, max(32, sqrt_tokens))
+        
+        # Calculate number of groups needed (ceil division)
+        num_groups = (num_tokens + group_size - 1) // group_size
+        
+        # Expert capacity calculation directly tied to top_k
+        # Each token chooses top_k experts, so we have (group_size * top_k) total assignments
+        # Divided by num_experts gives average assignments per expert
+        # Multiplied by capacity_factor for overprovisioning
+        expert_capacity = int((group_size * self.top_k * self.capacity_factor) / self.num_total_experts)
+        
+        # Apply bounds to expert capacity
+        min_capacity = max(
+            self.min_expert_capacity,  # Absolute minimum
+            self.top_k,                # At least top_k to handle worst case of all tokens selecting same expert
+            int(group_size * 0.01)     # At least 1% of group size
+        )
+        
+        max_capacity = min(
+            group_size,               # At most all tokens in a group
+            int(group_size * 0.25)    # Cap at 25% of group size to prevent excessive memory usage
+        )
+        
+        # Final expert capacity within bounds
+        expert_capacity = min(max_capacity, max(expert_capacity, min_capacity))
+        
+        return group_size, num_groups, expert_capacity
+    
+    def _process_shared_experts(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Process shared experts in parallel."""
+        if not self.num_shared_experts:
+            return jnp.zeros_like(x)
+        
+        x_expanded = x[:, :, None, :]
+        shared_outputs = self.shared_experts(x_expanded)  # [batch, seq, num_shared_experts, d_model]
+        output = jnp.mean(shared_outputs, axis=2)  # [batch, seq, d_model]
+
+        return output
+    
+    def _group_inputs(self, x: jnp.ndarray) -> tuple[jnp.ndarray, int, tuple[int, int]]:
+        original_batch_size, original_seq_len, _ = x.shape
+        group_size, num_groups, expert_capacity = self._compute_group_size(original_batch_size, original_seq_len)
+        
+        # Save original shape for depadding
+        original_shape = (original_batch_size, original_seq_len)
+        
+        # Calculate total tokens and required padding
+        total_tokens = original_batch_size * original_seq_len
+        padded_size = num_groups * group_size
+        padding_needed = padded_size - total_tokens
+        
+        if padding_needed > 0:
+            # Approach: Flatten first, then pad at the end - this ensures padding is always at the end
+            # which makes it easier to remove reliably during degroup
+            x_flat = x.reshape(-1, self.d_model)
+            
+            # Add padding at the end - simplest and most reliable approach
+            x_padded = jnp.pad(
+                x_flat,
+                pad_width=((0, padding_needed), (0, 0)),
+                mode='constant',
+                constant_values=0
+            )
+            
+            # Reshape padded tensor to grouped format
+            x_grouped = x_padded.reshape(num_groups, group_size, self.d_model)
+        else:
+            # No padding needed, reshape directly
+            x_grouped = x.reshape(num_groups, group_size, self.d_model)
+        
+        return x_grouped, expert_capacity, original_shape
+
+    def _degroup_outputs(self, x: jnp.ndarray, original_shape: tuple[int, int]) -> jnp.ndarray:
+        original_batch_size, original_seq_len = original_shape
+        
+        # Calculate the original total tokens
+        total_tokens = original_batch_size * original_seq_len
+        
+        # Flatten the grouped tensor
+        x_flat = x.reshape(-1, self.d_model)
+        
+        # Remove padding by slicing to original size
+        # Since padding was added at the end in _group_inputs, we slice from the beginning
+        x_unpadded = x_flat[:total_tokens]
+        
+        # Reshape to original dimensions
+        output = x_unpadded.reshape(original_batch_size, original_seq_len, self.d_model)
+        
+        return output
+    
+    def _train_routing(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        x_grouped, expert_capacity, original_shape = self._group_inputs(x)
+        combine_tensor, dispatch_mask, router_loss = self.router(x_grouped, expert_capacity)
+        output = self._process_shared_experts(x_grouped)
+
+        # Process feedforward experts
+        if self.num_ff_experts > 0:
+            # Get the routing for feedforward experts
+            ff_dispatch = dispatch_mask[:, :, :self.num_ff_experts, :]
+            ff_combine = combine_tensor[:, :, :self.num_ff_experts, :]
+            
+            # Route tokens to experts via einsum
+            # [G, S, E, C] and [G, S, d] => [G, S, E, d]
+            expert_inputs = jnp.einsum('GSEC,GSd->GSEd', ff_dispatch, x_grouped)
+            # Process all feedforward experts in parallel
+            expert_outputs = self.feedforward_experts(expert_inputs)
+            # Combine expert outputs back: [G, S, E, d] and [G, S, E, C] => [G, S, d]
+            ff_output = jnp.einsum('GSEd,GSEC->GSd', expert_outputs, ff_combine)
+            
+            output = output + ff_output
+        
+        output = self._degroup_outputs(output, original_shape)
+
+        return output, router_loss
+    
+    def _eval_routing(self, x):
+        output = self._process_shared_experts(x)
+        
+        expert_gate, expert_index, _ = self.router(x)
+                
+        if self.num_ff_experts > 0:
+            ff_mask = expert_index < self.num_ff_experts
+            
+            ff_weights = expert_gate * ff_mask
+            
+            ff_weights_sum = jnp.sum(ff_weights, axis=-1, keepdims=True)
+            ff_weights = ff_weights / (ff_weights_sum + 1e-9)
+            
+            ff_indices = jnp.where(ff_mask, expert_index, 0)
+            
+            ff_output = self.feedforward_experts.process_by_indices(
+                x, ff_indices, ff_weights
+            )
+            
+            output = output + ff_output
+
+        return output
+    
+    def __call__(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        if self.training or x.shape[0] * x.shape[1] > 18:
+            return self._train_routing(x)
+        else:
+            return self._eval_routing(x), None
+
+class Block(nnx.Module):
+    def __init__(self, 
+        d_model: int,
+        hidden_dim: int,
+        num_heads: int,
+        head_dim: int,
+        num_experts: int = 8,
+        num_shared_experts: int = 1,
+        top_k: int = 2,
+        capacity_factor: float = 2.0,
+        min_expert_capacity: int = 8,
+        max_group_size: int = 4096,
+        router_z_loss_coef: float = 1e-3,
+        router_balance_loss_coef: float = 1e-4,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        use_gradient_checkpointing: bool = False,
+        init_fn = None,
+        layer_idx: int = 0,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.min_expert_capacity = min_expert_capacity
+        self.max_group_size = max_group_size
+        self.router_z_loss_coef = router_z_loss_coef
+        self.router_balance_loss_coef = router_balance_loss_coef
+        self.dtype = dtype
+        self.training = training
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.layer_idx = layer_idx
+        
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+        
+        # Pre-normalization layers (norm before attention and MoE)
+        self.attn_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        self.moe_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        
+        # Multi-head attention
+        self.attention = MultiHeadAttention(
+            num_heads=self.num_heads,
+            d_model=self.d_model,
+            head_dim=self.head_dim,
+            dtype=self.dtype,
+            training=self.training,
+            init_fn=init_fn,
+            rngs=rngs
+        )
+        
+        # MoE feedforward network
+        self.feedforward = MixtureLayer(
+            d_model=self.d_model,
+            hidden_dim=self.hidden_dim,
+            num_total_experts=self.num_experts,
+            num_shared_experts=self.num_shared_experts,
+            top_k=self.top_k,
+            capacity_factor=self.capacity_factor,
+            min_expert_capacity=self.min_expert_capacity,
+            max_group_size=self.max_group_size,
+            router_z_loss_coef=self.router_z_loss_coef,
+            router_balance_loss_coef=self.router_balance_loss_coef,
+            dtype=self.dtype,
+            training=self.training,
+            init_fn=init_fn,
+            rngs=rngs
+        )
+        
+    def forward(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        # Pre-normalization for attention
+        attn_norm_x = self.attn_norm(x)
+        
+        # Attention with residual connection
+        attn_output = self.attention(attn_norm_x, attn_mask)
+        x = x + attn_output
+        
+        # Pre-normalization for MoE
+        ff_norm_x = self.moe_norm(x)
+        
+        # MoE with residual connection
+        ff_output, router_loss = self.feedforward(ff_norm_x)
+        x = x + ff_output
+        
+        return x, router_loss
+    
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        if self.use_gradient_checkpointing:
+            return nnx.remat(self.forward)(x, attn_mask)
+        return self.forward(x, attn_mask)
+
+class Transformer(nnx.Module):
+    def __init__(self,
+        d_model: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        vocab_size: int,
+        num_experts: int = 8,
+        num_shared_experts: int = 1,
+        top_k: int = 2,
+        capacity_factor: float = 2.0,
+        min_expert_capacity: int = 8,
+        max_group_size: int = 4096,
+        router_z_loss_coef: float = 1e-3,
+        router_balance_loss_coef: float = 1e-4,
+        dtype: jnp.dtype = jnp.float32,
+        training: bool = False,
+        use_gradient_checkpointing: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.vocab_size = vocab_size
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.min_expert_capacity = min_expert_capacity
+        self.max_group_size = max_group_size
+        self.router_z_loss_coef = router_z_loss_coef
+        self.router_balance_loss_coef = router_balance_loss_coef
+        self.dtype = dtype
+        self.training = training
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+        
+        key = rngs.params()
+        embedding_key, output_key = jax.random.split(key, 2)
+        
+        # Token embeddings
+        self.token_embedding = nnx.Param(
+            init_fn(embedding_key, (self.vocab_size, self.d_model)),
+            sharding=(None, 'model'),
+            dtype=self.dtype,
+        )
+        
+        # Create transformer blocks
+        self.blocks = [
+            Block(
+                d_model=self.d_model,
+                hidden_dim=self.hidden_dim,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                num_experts=self.num_experts,
+                num_shared_experts=self.num_shared_experts,
+                top_k=self.top_k,
+                capacity_factor=self.capacity_factor,
+                min_expert_capacity=self.min_expert_capacity,
+                max_group_size=self.max_group_size,
+                router_z_loss_coef=self.router_z_loss_coef,
+                router_balance_loss_coef=self.router_balance_loss_coef,
+                dtype=self.dtype,
+                training=self.training,
+                use_gradient_checkpointing=self.use_gradient_checkpointing,
+                init_fn=init_fn,
+                layer_idx=layer_idx,
+                rngs=rngs
+            ) for layer_idx in range(self.num_layers)
+        ]
+        
+        # Final layer normalization
+        self.final_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        
+        # Output projection
+        self.lm_head = nnx.Param(
+            init_fn(output_key, (self.d_model, self.vocab_size)),
+            sharding=('model', None),
+            dtype=self.dtype,
+        )
+        
+    def __call__(self, input_ids: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+
+        x = self.token_embedding[input_ids]
+        
+        # Initialize router loss accumulator only if in training mode
+        router_loss = jnp.zeros((), dtype=self.dtype)
+        
+        # Process through transformer blocks
+        for i, block in enumerate(self.blocks):
+            # During inference, don't track losses at all
+            if not self.training:
+                x, _ = block(x, attn_mask)
+            else:
+                x, block_loss = block(x, attn_mask)
+                # In training mode, always accumulate losses
+                router_loss += block_loss
+        
+        # Final normalization
+        x = self.final_norm(x)
+        
+        # Project to vocabulary
+        logits = x @ self.lm_head
+        
+        router_loss /= self.num_layers
+        
+        return logits, router_loss
+
+class Test():
+    def __init__(self):
+        self.batch_size = 1
+        self.seq_len = 16
+        self.d_model = 512
+        self.num_heads = 6
+        self.head_dim = 64
+        self.hidden_dim = 2048
+        self.num_experts = 4
+        self.num_shared_experts = 2
+        self.num_layers = 2
+        self.vocab_size = 32000
+
+        rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
+        self.mha = MultiHeadAttention(self.num_heads, self.d_model, self.head_dim, training=True, rngs=rngs)
+        self.ff = FeedForward(self.d_model, self.hidden_dim, self.num_experts, training=True, rngs=rngs)
+        self.router = Router(self.d_model, self.num_experts, training=True, rngs=rngs)
+        self.experts = MixtureLayer(self.d_model, self.hidden_dim, self.num_experts, self.num_shared_experts, training=True, rngs=rngs)
+        
+        # Add full transformer model
+        self.transformer = Transformer(
+            d_model=self.d_model,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            vocab_size=self.vocab_size,
+            num_experts=self.num_experts,
+            num_shared_experts=self.num_shared_experts,
+            training=True,
+            rngs=rngs
+        )
+
+    @staticmethod
+    @nnx.jit
+    def test_mha(module, x):
+        return module(x)
+
+    @staticmethod
+    @nnx.jit
+    def test_ff(module, x):
+        return module(x)
+
+    @staticmethod
+    @nnx.jit
+    def test_router(module, x):
+        # Use a static expert capacity for jit compilation
+        expert_capacity = 4  # Fixed value instead of passing it dynamically
+        return module(x, expert_capacity)
+
+    @staticmethod
+    @nnx.jit
+    def test_experts(module, x):
+        return module(x)
+
+    @staticmethod
+    @nnx.jit
+    def test_transformer(module, input_ids):
+        return module(input_ids)
+
+    def __call__(self):
+        results = {}
+        
+        # Test MHA
+        x_mha = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+        try:
+            y = self.test_mha(self.mha, x_mha)
+            print("MHA output shape:", y.shape)
+            results['MHA'] = 'SUCCESS'
+        except Exception as e:
+            print("MHA error:", e)
+            results['MHA'] = 'FAILED'
+        
+        # Test FF
+        x_ff = jnp.ones((self.batch_size, self.seq_len, self.num_experts, self.d_model))
+        try:
+            y = self.test_ff(self.ff, x_ff)
+            print("FF output shape:", y.shape)
+            results['FF'] = 'SUCCESS'
+        except Exception as e:
+            print("FF error:", e)
+            results['FF'] = 'FAILED'
+        
+        # Test Router
+        x_router = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+        try:
+            a, b, c = self.test_router(self.router, x_router)  # Removed expert_capacity argument
+            print("Router outputs:", a.shape, b.shape, c)
+            results['Router'] = 'SUCCESS'
+        except Exception as e:
+            print("Router error:", e)
+            results['Router'] = 'FAILED'
+        
+        # Test Experts
+        x_experts = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+        try:
+            y, z = self.test_experts(self.experts, x_experts)
+            print("Experts output shape and loss:", y.shape, z)
+            results['Experts'] = 'SUCCESS'
+        except Exception as e:
+            print("Experts error:", e)
+            results['Experts'] = 'FAILED'
+        
+        # Test the full transformer
+        input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+        try:
+            logits, avg_loss = self.test_transformer(self.transformer, input_ids)
+            print("Transformer output shape and avg loss:", logits.shape, avg_loss)
+            results['Transformer'] = 'SUCCESS'
+        except Exception as e:
+            print("Transformer error:", e)
+            results['Transformer'] = 'FAILED'
+        
+        # Display module info
+        print("\nModule details:")
+        nnx.display(self.mha)
+        nnx.display(self.ff)
+        nnx.display(self.router)
+        nnx.display(self.experts)
+        nnx.display(self.transformer)
+        
+        # Print test summary
+        print("\nTest Summary:")
+        print("-" * 30)
+        for test_name, result in results.items():
+            print(f"{test_name:15} | {result}")
+        print("-" * 30)
+        successes = sum(1 for result in results.values() if result == 'SUCCESS')
+        failures = sum(1 for result in results.values() if result == 'FAILED')
+        print(f"Total: {len(results)} tests ({successes} passed, {failures} failed)")
+
+if __name__ == "__main__":
+    test = Test()
+    test()

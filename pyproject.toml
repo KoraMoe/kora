@@ -1,0 +1,14 @@
+[project]
+name = "kora"
+version = "0.1.0"
+description = ""
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.3.2",
+    "flax>=0.10.4",
+    "jax>=0.5.2",
+    "optax>=0.2.4",
+    "orbax>=0.1.9",
+    "transformers>=4.49.0",
+]
