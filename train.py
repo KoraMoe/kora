@@ -152,53 +152,26 @@ def create_learning_rate_schedule(
     )
 
 class BatchLoader:
-    """Efficient batch loader with parallel prefetching and sharding."""
+    """Efficient batch loader using generators for prefetching."""
     def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 3):
         self.dataset = dataset
         self.batch_size = batch_size
         self.data_spec = data_spec
-        # Use the same seed for all processes
         self.base_seed = seed
         self.num_prefetch = num_prefetch
-        
-        # Thread-safe queue for prefetched batches
-        self._prefetch_queue = Queue(maxsize=num_prefetch)
         
         # Calculate number of batches
         self.num_samples = len(dataset)
         self.steps_per_epoch = self.num_samples // batch_size
         
-        # Initialize indices with thread lock
-        self._lock = threading.Lock()
+        # Initialize state
         self.current_epoch = 0
         self.current_idx = 0
         # Initial shuffle with base seed
         self.indices = np.random.RandomState(seed=self.base_seed).permutation(self.num_samples)
         
-        # Control flags
-        self._stop_prefetching = threading.Event()
-        self._worker_error = None
-        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-        self._prefetch_thread.start()
-    
-    def _shuffle_indices(self):
-        """Thread-safe shuffle of dataset indices."""
-        with self._lock:
-            # Set the same seed for all processes based on the epoch
-            epoch_seed = self.base_seed + self.current_epoch
-            self.indices = np.random.RandomState(seed=epoch_seed).permutation(self.num_samples)
-            self.current_idx = 0
-            self.current_epoch += 1
-    
-    def _get_next_batch_indices(self):
-        """Thread-safe retrieval of next batch indices."""
-        with self._lock:
-            if self.current_idx + self.batch_size > len(self.indices):
-                self._shuffle_indices()
-            
-            batch_indices = self.indices[self.current_idx:self.current_idx + self.batch_size]
-            self.current_idx += self.batch_size
-            return batch_indices
+        # Initialize the generator
+        self._iterator = self._batch_generator()
     
     def _create_batch(self, indices):
         """Create a sharded batch from indices."""
@@ -213,70 +186,42 @@ class BatchLoader:
         
         return examples
     
-    def _prefetch_worker(self):
-        """Background worker that continuously prefetches batches."""
-        while not self._stop_prefetching.is_set():
-            try:
-                # Get next batch indices
-                batch_indices = self._get_next_batch_indices()
-                
-                # Create batch
-                batch = self._create_batch(batch_indices)
-                
-                # Add to queue with timeout to allow checking stop flag
-                self._prefetch_queue.put(batch, timeout=1.0)
-            except Exception as e:
-                # Store the error and exit
-                self._worker_error = e
-                print(f"Error in prefetch worker: {str(e)}")
-                break
+    def _shuffle_indices(self):
+        """Shuffle dataset indices using deterministic seed based on epoch."""
+        epoch_seed = self.base_seed + self.current_epoch
+        self.indices = np.random.RandomState(seed=epoch_seed).permutation(self.num_samples)
+        self.current_idx = 0
+        self.current_epoch += 1
     
-    def restart_worker(self):
-        """Restart the prefetch worker thread if it died."""
-        if hasattr(self, '_prefetch_thread') and not self._prefetch_thread.is_alive():
-            # Clear the queue
-            while not self._prefetch_queue.empty():
-                try:
-                    self._prefetch_queue.get_nowait()
-                except:
-                    pass
+    def _batch_generator(self):
+        """Generator that yields batches with prefetching."""
+        from collections import deque
+        
+        # Create a deque for prefetching
+        prefetch_queue = deque(maxlen=self.num_prefetch)
+        
+        def get_next_batch():
+            if self.current_idx + self.batch_size > len(self.indices):
+                self._shuffle_indices()
             
-            # Reset error state
-            self._worker_error = None
-            
-            # Start a new thread
-            self._prefetch_thread = threading.Thread(target=self._prefetch_worker, daemon=True)
-            self._prefetch_thread.start()
-            
-            # Give the thread time to start
-            time.sleep(0.1)
+            batch_indices = self.indices[self.current_idx:self.current_idx + self.batch_size]
+            self.current_idx += self.batch_size
+            return self._create_batch(batch_indices)
+        
+        # Initial prefetch
+        for _ in range(self.num_prefetch):
+            prefetch_queue.append(get_next_batch())
+        
+        # Main loop
+        while True:
+            # Yield the next batch
+            yield prefetch_queue.popleft()
+            # Prefetch next batch
+            prefetch_queue.append(get_next_batch())
     
     def next(self):
-        """Get next batch from the prefetch queue."""
-        # Check if worker is alive, if not restart it
-        if hasattr(self, '_prefetch_thread') and not self._prefetch_thread.is_alive():
-            self.restart_worker()
-        
-        try:
-            return self._prefetch_queue.get(timeout=10.0)
-        except Exception as e:
-            # Try to restart the worker if it's dead
-            self.restart_worker()
-            try:
-                # Try one more time
-                return self._prefetch_queue.get(timeout=10.0)
-            except:
-                if self._worker_error:
-                    error_msg = f"Prefetching thread encountered an error: {str(self._worker_error)}"
-                else:
-                    error_msg = "Timeout waiting for next batch. Prefetching thread may have died."
-                raise RuntimeError(error_msg)
-    
-    def __del__(self):
-        """Cleanup method to stop background thread."""
-        self._stop_prefetching.set()
-        if hasattr(self, '_prefetch_thread'):
-            self._prefetch_thread.join(timeout=5.0)
+        """Get next batch from the generator."""
+        return next(self._iterator)
 
 def count_params(model: Transformer) -> float:
     """Count total number of trainable parameters in billions."""
@@ -383,30 +328,29 @@ def load_checkpoint(
     if batch_loader is not None:
         try:
             batch_state = restored["batch_state"]
-            with batch_loader._lock:
-                batch_loader.current_epoch = batch_state["current_epoch"]
-                batch_loader.current_idx = batch_state["current_idx"]
-                
-                # Handle potential issues with indices
-                indices = batch_state["indices"]
-                if len(indices) > 0:
-                    # Ensure indices are within the valid range for the dataset
-                    indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
-                    batch_loader.indices = indices
-                else:
-                    batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-
-            # Restart the prefetch worker to ensure it's in a good state
-            batch_loader.restart_worker()
+            batch_loader.current_epoch = batch_state["current_epoch"]
+            batch_loader.current_idx = batch_state["current_idx"]
+            
+            # Handle potential issues with indices
+            indices = batch_state["indices"]
+            if len(indices) > 0:
+                # Ensure indices are within the valid range for the dataset
+                indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
+                batch_loader.indices = indices
+            else:
+                batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+            
+            # Reinitialize the generator with the restored state
+            batch_loader._iterator = batch_loader._batch_generator()
+            
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
             print("Reinitializing batch loader...")
             # Reset the batch loader to initial state
-            with batch_loader._lock:
-                batch_loader.current_epoch = 0
-                batch_loader.current_idx = 0
-                batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader.restart_worker()
+            batch_loader.current_epoch = 0
+            batch_loader.current_idx = 0
+            batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+            batch_loader._iterator = batch_loader._batch_generator()
     
     return restored["step"], restored.get("metrics", {})
 
