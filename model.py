@@ -269,7 +269,14 @@ class Router(nnx.Module):
         gating_logits = gating_logits + self.gate_bias
         
         gating_probs = nnx.softmax(gating_logits)
-        expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
+        if self.training:
+            @partial(jax.vmap, in_axes=(0, None))
+            @partial(jax.vmap, in_axes=(0, None))
+            def vmapped_approx_max_k(probs, k):
+                return jax.lax.approx_max_k(probs, k)
+            expert_gate, expert_index = vmapped_approx_max_k(gating_probs, self.top_k)
+        else:
+            expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
         
         if expert_capacity is None:
             return expert_gate, expert_index, None
@@ -304,7 +311,8 @@ class Router(nnx.Module):
             combine_tensor_per_assignment,
             jax.sharding.PartitionSpec('data', None, None, None)
         )
-        combine_tensor = jnp.sum(combine_tensor_per_assignment, axis=2)
+        # Replace slow reduction with fast einsum
+        combine_tensor = jnp.einsum('gstec->gsec', combine_tensor_per_assignment)
         
         # Remove the first position (zero position) from capacity dimension
         combine_tensor = combine_tensor[..., 1:]
@@ -320,7 +328,7 @@ class MixtureLayer(nnx.Module):
         hidden_dim: int,
         num_total_experts: int,
         num_shared_experts: int,
-        top_k: int = 2, # theoretically top_k = capacity_factor
+        top_k: int = 2,
         capacity_factor: float = 2.0,
         min_expert_capacity: int = 8,
         max_group_size: int = 4096,
