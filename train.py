@@ -1,7 +1,4 @@
 import os
-import threading
-from queue import Queue
-import time
 
 from config import *
 import numpy as np
@@ -102,7 +99,7 @@ def eval_step(model: Transformer, metrics: nnx.MultiMetric, batch):
     )
 
 def make_mesh():
-    mesh = jax.make_mesh(MESH_SHAPE, ("expert", "data"))
+    mesh = jax.make_mesh(MESH_SHAPE, ("data", "expert"))
     return mesh
 
 def load_dataset():
@@ -156,44 +153,67 @@ def create_learning_rate_schedule(
     )
 
 class BatchLoader:
-    """Efficient batch loader using generators for prefetching."""
+    """Efficient batch loader using generators for prefetching with data sharding across processes."""
     def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 3):
         self.dataset = dataset
-        self.batch_size = batch_size
+        self.global_batch_size = batch_size
         self.data_spec = data_spec
         self.base_seed = seed
         self.num_prefetch = num_prefetch
         
-        # Calculate number of batches
+        # Process-specific information
+        self.process_id = jax.process_index()
+        self.num_processes = jax.process_count()
+        
+        # Calculate per-process batch size
+        assert self.global_batch_size % self.num_processes == 0, "Batch size must be divisible by number of processes"
+        self.local_batch_size = self.global_batch_size // self.num_processes
+        
+        # Calculate number of samples and steps
         self.num_samples = len(dataset)
-        self.steps_per_epoch = self.num_samples // batch_size
+        self.steps_per_epoch = self.num_samples // self.global_batch_size
         
         # Initialize state
         self.current_epoch = 0
         self.current_idx = 0
+        
         # Initial shuffle with base seed
-        self.indices = np.random.RandomState(seed=self.base_seed).permutation(self.num_samples)
+        self._shuffle_indices()
         
         # Initialize the generator
         self._iterator = self._batch_generator()
     
     def _create_batch(self, indices):
-        """Create a sharded batch from indices."""
+        """Create a sharded batch from indices for the current process."""
         examples = {}
         # Ensure indices are valid and within range
         valid_indices = np.clip(indices, 0, len(self.dataset) - 1)
         batch_data = self.dataset[valid_indices]
         
         for k, v in batch_data.items():
-            array = jnp.array(v)
-            examples[k] = jax.device_put(array, self.data_spec)
+            array = np.array(v, dtype=jnp.int16)
+            examples[k] = jax.make_array_from_process_local_data(
+                self.data_spec,
+                array
+            )
         
         return examples
     
     def _shuffle_indices(self):
         """Shuffle dataset indices using deterministic seed based on epoch."""
         epoch_seed = self.base_seed + self.current_epoch
-        self.indices = np.random.RandomState(seed=epoch_seed).permutation(self.num_samples)
+        rng = np.random.RandomState(seed=epoch_seed)
+        
+        # Shuffle all indices first
+        all_indices = rng.permutation(self.num_samples)
+        
+        # Calculate process-specific shard of indices
+        shard_size = len(all_indices) // self.num_processes
+        start_idx = self.process_id * shard_size
+        end_idx = start_idx + shard_size if self.process_id < self.num_processes - 1 else len(all_indices)
+        
+        # Get process-specific indices
+        self.indices = all_indices[start_idx:end_idx]
         self.current_idx = 0
         self.current_epoch += 1
     
@@ -205,11 +225,12 @@ class BatchLoader:
         prefetch_queue = deque(maxlen=self.num_prefetch)
         
         def get_next_batch():
-            if self.current_idx + self.batch_size > len(self.indices):
+            if self.current_idx + self.local_batch_size > len(self.indices):
                 self._shuffle_indices()
             
-            batch_indices = self.indices[self.current_idx:self.current_idx + self.batch_size]
-            self.current_idx += self.batch_size
+            # Get local batch indices for this process
+            batch_indices = self.indices[self.current_idx:self.current_idx + self.local_batch_size]
+            self.current_idx += self.local_batch_size
             return self._create_batch(batch_indices)
         
         # Initial prefetch
@@ -218,9 +239,7 @@ class BatchLoader:
         
         # Main loop
         while True:
-            # Yield the next batch
             yield prefetch_queue.popleft()
-            # Prefetch next batch
             prefetch_queue.append(get_next_batch())
     
     def next(self):
@@ -322,7 +341,12 @@ def load_checkpoint(
     
     # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
-    restored = ckpt_manager.restore(step, abs_target)
+    restore_args = ocp.checkpoint_utils.construct_restore_args(abs_target)
+    restored = ckpt_manager.restore(
+        step,
+        items=abs_target,
+        restore_kwargs={'restore_args': restore_args}
+    )
     
     # Update model and optimizer states
     nnx.state(model).update(restored["model"])

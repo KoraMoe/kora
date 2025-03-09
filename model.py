@@ -24,7 +24,7 @@ class RMSNorm(nnx.Module):
     def __init__(self, 
         dim: int,
         epsilon: float = 1e-6,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
         self.dim = dim
@@ -51,7 +51,7 @@ class RotaryEmbedding(nnx.Module):
     def __init__(self, 
         dim: int, 
         base: int = 10000,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
     ):
         self.dim = dim
@@ -91,7 +91,7 @@ class MultiHeadAttention(nnx.Module):
         num_heads: int, 
         d_model: int,
         head_dim: int,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -161,7 +161,7 @@ class FeedForward(nnx.Module):
         d_model: int,
         hidden_dim: int,
         num_experts: int = 1,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -247,7 +247,7 @@ class Router(nnx.Module):
         z_loss_coef: float = 1e-3,
         balance_loss_coef: float = 1e-4,
         top_k: int = 2,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -343,7 +343,7 @@ class MixtureLayer(nnx.Module):
         max_group_size: int = 4096,
         router_z_loss_coef: float = 1e-3,
         router_balance_loss_coef: float = 1e-4,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -578,7 +578,7 @@ class Block(nnx.Module):
         max_group_size: int = 4096,
         router_z_loss_coef: float = 1e-3,
         router_balance_loss_coef: float = 1e-4,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         use_gradient_checkpointing: bool = False,
         init_fn = None,
@@ -676,7 +676,7 @@ class Transformer(nnx.Module):
         max_group_size: int = 4096,
         router_z_loss_coef: float = 1e-3,
         router_balance_loss_coef: float = 1e-4,
-        dtype: jnp.dtype = jnp.float32,
+        dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         use_gradient_checkpointing: bool = False,
         init_fn = None,
