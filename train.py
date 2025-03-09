@@ -492,9 +492,8 @@ def main():
             elif step == 30:
                 jax.profiler.stop_trace()
             
-            loss = train_step(model, optimizer, train_metrics, batch)
+            train_step(model, optimizer, train_metrics, batch)
             progress_bar.update(1)
-            progress_bar.set_description(f"Training <{loss:.4f}>")
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
                 metrics_values = train_metrics.compute()
