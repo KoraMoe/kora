@@ -34,12 +34,12 @@ def calculate_metrics(logits, labels, mask):
         shift_logits,
         shift_labels,
     )
-    loss = (loss * loss_mask).sum() / (loss_mask.sum() + 1e-9)
+    loss = (loss * loss_mask).sum(axis=1) / (loss_mask.sum(axis=1) + 1e-9)
     
     # Calculate accuracy
     predictions = jnp.argmax(shift_logits, axis=-1)
     correct_predictions = (predictions == shift_labels) * loss_mask
-    accuracy = correct_predictions.sum() / (loss_mask.sum() + 1e-9)
+    accuracy = correct_predictions.sum(axis=1) / (loss_mask.sum(axis=1) + 1e-9)
     
     # Calculate perplexity
     perplexity = jnp.exp(loss)
@@ -57,7 +57,10 @@ def train_step(model: Transformer, optimizer: nnx.Optimizer, metrics: nnx.MultiM
         )
         
         total_loss = loss + router_loss
-        return total_loss, (loss, accuracy, perplexity, router_loss)
+        # Final reduction
+        final_loss = jnp.mean(total_loss)
+        
+        return final_loss, (loss, accuracy, perplexity, router_loss)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     (total_loss, (loss, accuracy, perplexity, router_loss)), grads = grad_fn(model)
@@ -65,13 +68,13 @@ def train_step(model: Transformer, optimizer: nnx.Optimizer, metrics: nnx.MultiM
     # Update model parameters
     optimizer.update(grads)
     
-    # Update metrics
+    # Update metrics - use mean of per-batch metrics
     metrics.update(
         total_loss=total_loss,
-        loss=loss,
-        router_loss=router_loss,
-        perplexity=perplexity,
-        accuracy=accuracy
+        loss=jnp.mean(loss),
+        router_loss=jnp.mean(router_loss),
+        perplexity=jnp.mean(perplexity),
+        accuracy=jnp.mean(accuracy)
     )
 
     return total_loss
@@ -86,18 +89,22 @@ def eval_step(model: Transformer, metrics: nnx.MultiMetric, batch):
             logits, batch['labels'], batch['attention_mask']
         )
         
+        # Combine losses per batch
         total_loss = loss + router_loss
-        return total_loss, (loss, accuracy, perplexity, router_loss)
+        # Final reduction
+        final_loss = jnp.mean(total_loss)
+        
+        return final_loss, (loss, accuracy, perplexity, router_loss)
     
     total_loss, (loss, accuracy, perplexity, router_loss) = loss_fn(model)
     
     # Update metrics
     metrics.update(
         total_loss=total_loss,
-        loss=loss,
-        router_loss=router_loss,
-        perplexity=perplexity,
-        accuracy=accuracy
+        loss=jnp.mean(loss),
+        router_loss=jnp.mean(router_loss),
+        perplexity=jnp.mean(perplexity),
+        accuracy=jnp.mean(accuracy)
     )
 
 def make_mesh():
