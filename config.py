@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import os
 
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500
@@ -14,7 +14,7 @@ TOKENIZER_NAME = "gpt2"
 CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
 LOG_STEPS = 10
 EVAL_STEPS = 5000
-MESH_SHAPE = (2, 8)  # (data, expert)
+MESH_SHAPE = (8, 2)  # (data, expert)
 
 VOCAB_SIZE = 50257
 VOCAB_SIZE = ((VOCAB_SIZE + 127) // 128) * 128
@@ -26,15 +26,15 @@ DATASET_CONFIG = {
 }
 
 MODEL_CONFIG = {
-    'd_model': 1024,
-    'hidden_dim': 8192,
+    'd_model': 768,
+    'hidden_dim': 4096,
     'num_layers': 16,
     'num_heads': 16,
     'head_dim': 64,
     'vocab_size': VOCAB_SIZE,
-    'num_experts': 4,
+    'num_experts': 8,
     'num_shared_experts': 1,
-    'top_k': 1,
+    'top_k': 2,
     'capacity_factor': 2.0,
     'min_expert_capacity': 8,
     'max_group_size': 4096,
