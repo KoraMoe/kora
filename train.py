@@ -481,8 +481,9 @@ def main():
             batch = train_loader.next()
 
             if step == 10:
-                with jax.profiler.trace("train_step", create_perfetto_trace=True):
-                    block_all(train_step(model, optimizer, train_metrics, batch))
+                jax.profiler.start_trace("train_step", create_perfetto_trace=True)
+            elif step == 20:
+                jax.profiler.stop_trace()
             
             train_step(model, optimizer, train_metrics, batch)
             

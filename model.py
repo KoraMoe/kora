@@ -124,8 +124,10 @@ class MultiHeadAttention(nnx.Module):
             sharding=(None, None, None),
             dtype=self.dtype,
         )
+    
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+        batch_size, seq_len, _ = x.shape
 
-    def _compute_qkv(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value) # reduce
         q, k, v = qkv
 
@@ -134,13 +136,6 @@ class MultiHeadAttention(nnx.Module):
         q = jnp.einsum('bshd->bhsd', q)
         k = jnp.einsum('bshd->bhsd', k)
         v = jnp.einsum('bshd->bhsd', v)
-
-        return q, k, v
-    
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
-        batch_size, seq_len, _ = x.shape
-
-        q, k, v = self._compute_qkv(x)
 
         scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / jnp.sqrt(self.head_dim)
         
@@ -177,12 +172,9 @@ class FeedForward(nnx.Module):
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
         
-        # Input projection weights and bias - store in transposed format for better compute efficiency
-        # Store as (d_model, num_experts, hidden_dim) instead of (num_experts, d_model, hidden_dim)
-        # This avoids transpose during computation
         self.keys = nnx.Param(
-            init_fn(key, (self.d_model, self.num_experts, self.hidden_dim)),
-            sharding=(None, 'expert', None),
+            init_fn(key, (self.num_experts, self.d_model, self.hidden_dim)),
+            sharding=('expert', None, None),
             dtype=self.dtype,
         )
         self.key_bias = nnx.Param(
@@ -190,12 +182,9 @@ class FeedForward(nnx.Module):
             sharding=('expert', None),
             dtype=self.dtype,
         )
-
-        # Output projection weights and bias - store in transposed format
-        # Store as (hidden_dim, num_experts, d_model) instead of (num_experts, hidden_dim, d_model)
         self.values = nnx.Param(
-            init_fn(key, (self.hidden_dim, self.num_experts, self.d_model)),
-            sharding=(None, 'expert', None),
+            init_fn(key, (self.num_experts, self.hidden_dim, self.d_model)),
+            sharding=('expert', None, None),
             dtype=self.dtype,
         )
         self.value_bias = nnx.Param(
@@ -207,90 +196,38 @@ class FeedForward(nnx.Module):
         self.act = nnx.gelu
     
     def process_by_indices(self, x: jnp.ndarray, indices: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
-        # indices shape: (batch, seq, top_k)
-        # Since weights are now in transposed format, we need to select differently
-        # Original shape: keys[e,d,h], values[e,h,d]
-        # New shape: keys[d,e,h], values[h,e,d]
-        
-        # Create index arrays for gathering from transposed weights
-        batch_size, seq_len, top_k = indices.shape
+        selected_keys = self.keys.value[indices, :]
+        selected_values = self.values.value[indices, :]
+        selected_key_bias = self.key_bias.value[indices]
+        selected_value_bias = self.value_bias.value[indices]
 
-        # Prepare indices for gathering
-        d_model = x.shape[-1]
-        hidden_dim = self.hidden_dim
+        # [batch, seq, d_model] @ [batch, seq, top_k, d_model, hidden_dim] -> [batch, seq, top_k, hidden_dim]
+        hidden = jnp.einsum('bsd,bskdh->bskh', x, selected_keys)
         
-        # Reshape inputs for batched processing
-        x_reshaped = x.reshape(-1, d_model)                  # [batch*seq, d_model]
-        indices_reshaped = indices.reshape(-1, top_k)        # [batch*seq, top_k]
-        weights_reshaped = weights.reshape(-1, top_k)        # [batch*seq, top_k]
+        # Add bias and apply activation
+        hidden = hidden + selected_key_bias
+        hidden = self.act(hidden)
         
-        # Define a function to process one token with all its top_k experts at once
-        def process_token_all_experts(token_vec, expert_indices, token_weights):
-            # Function to process a single token-expert pair
-            def process_single_expert(expert_idx):
-                # Get the expert weights using gather operations instead of dynamic_slice
-                # This is more efficient when compiled with XLA
-                
-                # For forward projection (keys)
-                # Extract the expert's weights from the transposed format
-                # Using advanced indexing on the expert dimension
-                key_weights = self.keys.value[:, expert_idx, :]  # [d_model, hidden_dim]
-                
-                # Compute hidden representation
-                hidden = jnp.dot(token_vec, key_weights)
-                hidden = hidden + self.key_bias.value[expert_idx]
-                hidden = self.act(hidden)
-                
-                # For backward projection (values)
-                value_weights = self.values.value[:, expert_idx, :]  # [hidden_dim, d_model]
-                
-                # Compute output
-                result = jnp.dot(hidden, value_weights)
-                result = result + self.value_bias.value[expert_idx]
-                
-                return result
-            
-            # Vectorize across all top_k experts for this token
-            # This replaces the outer loop with a single vectorized operation
-            results = jax.vmap(process_single_expert)(expert_indices)  # [top_k, d_model]
-            
-            # Apply weights and sum
-            weighted_results = results * token_weights[:, None]  # [top_k, d_model]
-            return jnp.sum(weighted_results, axis=0)  # [d_model]
-        
-        # Vectorize across all batch*seq tokens
-        output_flat = jax.vmap(process_token_all_experts)(
-            x_reshaped, 
-            indices_reshaped, 
-            weights_reshaped
-        )  # [batch*seq, d_model]
-        
-        # Reshape back to original format
-        output = output_flat.reshape(batch_size, seq_len, d_model)
+        # [batch, seq, top_k, hidden_dim] @ [batch, seq, top_k, d_model] -> [batch, seq, d_model]
+        output = jnp.einsum('bskh,bskhd,bsk->bsd', hidden, selected_values, weights)
+        weighted_bias = jnp.sum(selected_value_bias * jnp.expand_dims(weights, axis=-1), axis=2)
+        # Add bias
+        output = output + weighted_bias
         
         return output
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        hidden = jax.lax.dot_general(
-            x,                    # bsed
-            self.keys.value,      # deh (already in optimal format)
-            (((3,), (0,)),        # Contract on d dimension 
-             ((2,), (1,)))        # Batch dimensions (e batches)
+        # Add sharding hints for expert-parallel computation
+        x = jax.lax.with_sharding_constraint(
+            x, jax.sharding.PartitionSpec('expert', 'data', None, None)
         )
         
-        # Add bias to each expert
-        hidden = hidden + self.key_bias[None, None, :, :]
+        hidden = jnp.einsum('ebsd,edh->ebsh', x, self.keys.value)
+        hidden = hidden + self.key_bias.value[:, None, None, :]
         hidden = self.act(hidden)
         
-        output = jax.lax.dot_general(
-            hidden,               # bseh
-            self.values.value,    # hed (already in optimal format)
-            (((3,), (0,)),        # Contract on h dimension
-             ((2,), (1,)))        # Batch dimensions (e batches)
-        )
-        
-        # Add bias to each expert
-        output = output + self.value_bias[None, None, :, :]
+        output = jnp.einsum('ebsh,ehd->ebsd', hidden, self.values.value)
+        output = output + self.value_bias.value[:, None, None, :]
         
         return output
 
@@ -333,51 +270,46 @@ class Router(nnx.Module):
 
     def __call__(self, x: jnp.ndarray, expert_capacity: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
         # x shape: (groups, size, d_model)
-        # Original: gating_logits = jnp.einsum('gsd,de->gse', x, self.gate_weight.value) + self.gate_bias[None, None, :]
-
-        gating_logits = jax.lax.dot_general(
-            x,                        # (groups, size, d_model)
-            self.gate_weight.value,   # (d_model, num_experts)
-            (((2,), (0,)),            # Contract along d_model dimension
-             ((), ()))                # No batched dimensions
-        ) + self.gate_bias[None, None, :]
+        gating_logits = jnp.einsum('gsd,de->gse', x, self.gate_weight.value)
+        gating_logits = gating_logits + self.gate_bias[None, None, :]
         
-        # Compute softmax and top-k in one contiguous block to leverage fusion
         gating_probs = nnx.softmax(gating_logits)
         expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
-
+        
         if expert_capacity is None:
             return expert_gate, expert_index, None
-
+        
         expert_mask = nnx.one_hot(expert_index, num_classes=self.num_experts)
-
         combined_expert_mask = jnp.sum(expert_mask, axis=2)
-
+        
         loss = None
         if self.training:
-            # Compute both losses together to avoid repeated access to gating data
             router_z_loss = jnp.mean(nnx.logsumexp(gating_logits, axis=-1) ** 2)
             router_balance_loss = jnp.mean(
                 jnp.mean(gating_probs, axis=1) * jnp.mean(combined_expert_mask, axis=1)
             ) * (jnp.mean(combined_expert_mask, axis=1).shape[-1] ** 2)
             
             loss = router_balance_loss * self.balance_loss_coef + router_z_loss * self.z_loss_coef
-
-        # Fuse the position calculation with cumsum to enable JAX optimization
-        # Use direct implementation of cumulative sum with multiplication
-        # which is equivalent to: position_in_expert = jnp.cumsum(expert_mask, axis=1) * expert_mask
+        
         position_in_expert = jnp.cumsum(expert_mask, axis=1) * expert_mask
-
         valid_assignment = jnp.less(position_in_expert, expert_capacity)
-        expert_gate_expanded = expert_gate[..., None]
         
-        combine_tensor = jnp.sum(
-            expert_gate_expanded[..., None] * 
-            valid_assignment.astype(expert_gate.dtype)[..., None] *
-            nnx.one_hot(position_in_expert, num_classes=expert_capacity),
-            axis=2
-        )[..., 1:]
+        # Apply valid assignments to expert gates
+        expert_gate_valid = expert_gate[..., None] * valid_assignment.astype(expert_gate.dtype)
         
+        # Create combine tensor with position-wise assignments
+        combine_tensor_per_assignment = (
+            expert_gate_valid[..., None] *
+            nnx.one_hot(position_in_expert, num_classes=expert_capacity)
+        )
+        
+        # Sum across top_k dimension to get final combine tensor
+        combine_tensor = jnp.sum(combine_tensor_per_assignment, axis=2)
+        
+        # Remove the first position (zero position) from capacity dimension
+        combine_tensor = combine_tensor[..., 1:]
+        
+        # Create dispatch mask from combine tensor
         dispatch_mask = combine_tensor.astype(bool)
 
         return combine_tensor, dispatch_mask, loss
@@ -455,74 +387,25 @@ class MixtureLayer(nnx.Module):
             )
     
     def _compute_group_size(self, batch_size, seq_len):
-        """
-        Compute the optimal group size and expert capacity for routing.
-        
-        Each token selects top_k experts, so the total expert assignments per group is 
-        (group_size * top_k). These assignments need to be distributed across num_experts,
-        so the average assignments per expert is (group_size * top_k) / num_experts.
-        We multiply by capacity_factor to overprovision and avoid dropped tokens.
-        """
-        # Convert batch_size and seq_len to integers for static computation
+        if self.training:
+            group_size = seq_len
+            num_groups = batch_size
+            expert_capacity = int((group_size * self.top_k * self.capacity_factor) / self.num_total_experts)
+            return group_size, num_groups, expert_capacity
+
         batch_size_int = int(batch_size)
         seq_len_int = int(seq_len)
         num_tokens = batch_size_int * seq_len_int
-        
-        # Calculate target group size more efficiently
-        # We aim for sqrt(tokens) as a heuristic balancing parallelism and communication
         sqrt_tokens = int(num_tokens ** 0.5)
-        target_group_size = min(self.max_group_size, max(32, sqrt_tokens))
-        
-        # For training, adjust group_size to ensure no padding is needed
-        # Find the largest divisor of num_tokens that's <= target_group_size
-        # This ensures that num_tokens % group_size == 0
-        if self.training:
-            # Start with target group size and work downward
-            # to find the largest divisor of num_tokens
-            group_size = target_group_size
-            while group_size > 0:
-                if num_tokens % group_size == 0:
-                    break
-                group_size -= 1
-                
-            # If we couldn't find a good divisor, use a different approach
-            # Find a group_size that's close to target but ensures no padding
-            if group_size < 32:  # If we went too small
-                # Try finding factors of num_tokens
-                factors = []
-                for i in range(32, target_group_size + 1):
-                    if num_tokens % i == 0:
-                        factors.append(i)
-                
-                if factors:
-                    # Choose the largest factor that's closest to our target
-                    group_size = max(factors)
-                else:
-                    # If no good factors, adjust batch or sequence length
-                    # Find the closest multiple of target_group_size to num_tokens
-                    group_size = target_group_size
-                    # Just use original approach - padding is unavoidable
-        else:
-            group_size = target_group_size
-        
-        # Calculate number of groups needed (ceil division)
+        group_size = min(self.max_group_size, max(32, sqrt_tokens))
         num_groups = (num_tokens + group_size - 1) // group_size
-        
-        # When training, we should have exact division (no remainder)
-        if self.training:
-            num_groups = num_tokens // group_size
-            
-        # Expert capacity calculation directly tied to top_k
-        # Each token chooses top_k experts, so we have (group_size * top_k) total assignments
-        # Divided by num_experts gives average assignments per expert
-        # Multiplied by capacity_factor for overprovisioning
+
         expert_capacity = int((group_size * self.top_k * self.capacity_factor) / self.num_total_experts)
         
-        # Apply bounds to expert capacity
         min_capacity = max(
-            self.min_expert_capacity,  # Absolute minimum
-            self.top_k,                # At least top_k to handle worst case of all tokens selecting same expert
-            int(group_size * 0.01)     # At least 1% of group size
+            self.min_expert_capacity,
+            self.top_k,
+            int(group_size * 0.01)
         )
         
         max_capacity = min(
@@ -540,9 +423,9 @@ class MixtureLayer(nnx.Module):
         if not self.num_shared_experts:
             return jnp.zeros_like(x)
         
-        x_expanded = x[:, :, None, :]
-        shared_outputs = self.shared_experts(x_expanded)  # [batch, seq, num_shared_experts, d_model]
-        output = jnp.mean(shared_outputs, axis=2)  # [batch, seq, d_model]
+        x_expanded = x[None, :, :, :]
+        shared_outputs = self.shared_experts(x_expanded)  # [num_shared_experts, batch, seq, d_model]
+        output = jnp.mean(shared_outputs, axis=0)  # [batch, seq, d_model]
 
         return output
     
@@ -553,6 +436,9 @@ class MixtureLayer(nnx.Module):
         # Calculate group parameters - keep these calculations static where possible
         # to enable better XLA fusion
         group_size, num_groups, expert_capacity = self._compute_group_size(original_batch_size, original_seq_len)
+
+        if self.training:
+            return x, expert_capacity, (original_batch_size, original_seq_len), False
         
         # Save original shape for depadding
         original_shape = (original_batch_size, original_seq_len)
@@ -588,8 +474,11 @@ class MixtureLayer(nnx.Module):
         return x_grouped, expert_capacity, original_shape, was_padded
 
     def _degroup_outputs(self, x: jnp.ndarray, original_shape: tuple[int, int], was_padded: bool = True) -> jnp.ndarray:
+        if self.training:
+            return x
+
         original_batch_size, original_seq_len = original_shape
-        
+
         # If no padding was applied, directly reshape back to original shape
         if not was_padded:
             return jnp.reshape(x, (original_batch_size, original_seq_len, x.shape[-1]))
@@ -612,48 +501,39 @@ class MixtureLayer(nnx.Module):
         return output
     
     def _train_routing(self, x: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray | None]:
-        # Step 1: Group inputs once and avoid repeated operations
         x_grouped, expert_capacity, original_shape, was_padded = self._group_inputs(x)
-        
-        # Step 2: Cache shared expert output computation while router is running
-        # This enables parallel computation of shared experts and router logic
         shared_output = self._process_shared_experts(x_grouped)
         
-        # Step 3: Get routing information in single router call to minimize communication
         combine_tensor, dispatch_mask, router_loss = self.router(x_grouped, expert_capacity)
-        
-        # initialize output with shared experts result
         output = shared_output
 
         if self.num_ff_experts > 0:
-            ff_dispatch = dispatch_mask[:, :, :self.num_ff_experts, :]
-            ff_combine = combine_tensor[:, :, :self.num_ff_experts, :]
+            ff_dispatch = dispatch_mask[:,:,:self.num_ff_experts]
+            ff_combine = combine_tensor[:,:,:self.num_ff_experts]
+            
+            # 1. DISPATCH: First all-to-all - tokens to experts
+            # Shape annotations for clarity
+            # ff_dispatch: [groups, size, experts, capacity]
+            # x_grouped: [groups, size, d_model]
+            dispatch_to_expert = jax.lax.with_sharding_constraint(
+                jnp.einsum('gsec,gsd->egsd', ff_dispatch, x_grouped),
+                jax.sharding.PartitionSpec('expert', 'data', None, None)
+            )
 
-            expert_inputs = jax.lax.dot_general(
-                ff_dispatch,            # [G, S, E, C]
-                x_grouped[:, :, None, :],  # [G, S, 1, d]
-                (((3,), (0,)),          # Contract on token capacity dimension (C) with a dummy dim
-                 ((0, 1), (0, 1)))      # Batch dimensions (G, S)
-            )
-            # Result shape: [G, S, E, d]
+            # 2. Process with experts (already sharded on expert dimension)
+            expert_outputs = self.feedforward_experts(dispatch_to_expert)  # [experts, groups, size, d_model]
             
-            # Process all feedforward experts in parallel
-            expert_outputs = self.feedforward_experts(expert_inputs)
-            # Original: ff_output = jnp.einsum('GSEd,GSEC->GSd', expert_outputs, ff_combine)
-            ff_output = jax.lax.dot_general(
-                expert_outputs,         # [G, S, E, d]
-                ff_combine[:, :, :, :, None],  # [G, S, E, C, 1]
-                (((2, 3), (2, 4)),      # Contract on E and d/dummy dimensions
-                 ((0, 1), (0, 1)))      # Batch dimensions (G, S)
+            # 3. COMBINE: Second all-to-all - results back to tokens
+            # ff_combine: [groups, size, experts, capacity]
+            # expert_outputs: [experts, groups, size, d_model]
+            combine_from_expert = jax.lax.with_sharding_constraint(
+                jnp.einsum('egsd,gsec->gsd', expert_outputs, ff_combine),
+                jax.sharding.PartitionSpec('data', None, None)
             )
-            # Result shape: [G, S, C] - need to sum over C
-            ff_output = jnp.sum(ff_output, axis=2)
-            
-            output = output + ff_output
+
+            output = output + combine_from_expert
         
-        # Final reshape to original dimensions
         output = self._degroup_outputs(output, original_shape, was_padded)
-
         return output, router_loss
     
     def _eval_routing(self, x):
@@ -907,13 +787,14 @@ class Test():
         self.num_shared_experts = 2
         self.num_layers = 2
         self.vocab_size = 32000
+        
 
         rngs = nnx.Rngs(params=jax.random.PRNGKey(0))
         self.mha = MultiHeadAttention(self.num_heads, self.d_model, self.head_dim, training=True, rngs=rngs)
         self.ff = FeedForward(self.d_model, self.hidden_dim, self.num_experts, training=True, rngs=rngs)
         self.router = Router(self.d_model, self.num_experts, training=True, rngs=rngs)
         self.experts = MixtureLayer(self.d_model, self.hidden_dim, self.num_experts, self.num_shared_experts, training=True, rngs=rngs)
-        
+        self.mesh = jax.make_mesh((1, 1), ('expert', 'data'))
         # Add full transformer model
         self.transformer = Transformer(
             d_model=self.d_model,
@@ -942,7 +823,7 @@ class Test():
     @nnx.jit
     def test_router(module, x):
         # Use a static expert capacity for jit compilation
-        expert_capacity = 4  # Fixed value instead of passing it dynamically
+        expert_capacity = 16  # Fixed value instead of passing it dynamically
         return module(x, expert_capacity)
 
     @staticmethod
@@ -956,77 +837,81 @@ class Test():
         return module(input_ids)
 
     def __call__(self):
-        results = {}
-        
-        # Test MHA
-        x_mha = jnp.ones((self.batch_size, self.seq_len, self.d_model))
-        attn_mask = jnp.ones((self.batch_size, self.seq_len))
-        attn_mask = attn_mask.at[:, self.seq_len - 4:].set(0)
-        try:
-            y = self.test_mha(self.mha, x_mha, attn_mask)
-            print("MHA output shape:", y.shape)
-            results['MHA'] = 'SUCCESS'
-        except Exception as e:
-            print("MHA error:", e)
-            results['MHA'] = 'FAILED'
-        
-        # Test FF
-        x_ff = jnp.ones((self.batch_size, self.seq_len, self.num_experts, self.d_model))
-        try:
-            y = self.test_ff(self.ff, x_ff)
-            print("FF output shape:", y.shape)
-            results['FF'] = 'SUCCESS'
-        except Exception as e:
-            print("FF error:", e)
-            results['FF'] = 'FAILED'
-        
-        # Test Router
-        x_router = jnp.ones((self.batch_size, self.seq_len, self.d_model))
-        try:
-            a, b, c = self.test_router(self.router, x_router)  # Removed expert_capacity argument
-            print("Router outputs:", a.shape, b.shape, c)
-            results['Router'] = 'SUCCESS'
-        except Exception as e:
-            print("Router error:", e)
-            results['Router'] = 'FAILED'
-        
-        # Test Experts
-        x_experts = jnp.ones((self.batch_size, self.seq_len, self.d_model))
-        try:
-            y, z = self.test_experts(self.experts, x_experts)
-            print("Experts output shape and loss:", y.shape, z)
-            results['Experts'] = 'SUCCESS'
-        except Exception as e:
-            print("Experts error:", e)
-            results['Experts'] = 'FAILED'
-        
-        # Test the full transformer
-        input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
-        try:
-            logits, avg_loss = self.test_transformer(self.transformer, input_ids)
-            print("Transformer output shape and avg loss:", logits.shape, avg_loss)
-            results['Transformer'] = 'SUCCESS'
-        except Exception as e:
-            print("Transformer error:", e)
-            results['Transformer'] = 'FAILED'
-        
-        # Display module info
-        print("\nModule details:")
-        nnx.display(self.mha)
-        nnx.display(self.ff)
-        nnx.display(self.router)
-        nnx.display(self.experts)
-        nnx.display(self.transformer)
-        
-        # Print test summary
-        print("\nTest Summary:")
-        print("-" * 30)
-        for test_name, result in results.items():
-            print(f"{test_name:15} | {result}")
-        print("-" * 30)
-        successes = sum(1 for result in results.values() if result == 'SUCCESS')
-        failures = sum(1 for result in results.values() if result == 'FAILED')
-        print(f"Total: {len(results)} tests ({successes} passed, {failures} failed)")
+        with self.mesh:
+            import traceback
+            results = {}
+            
+            # Test MHA
+            x_mha = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+            attn_mask = jnp.ones((self.batch_size, self.seq_len))
+            attn_mask = attn_mask.at[:, self.seq_len - 4:].set(0)
+            try:
+                y = self.test_mha(self.mha, x_mha, attn_mask)
+                print("MHA output shape:", y.shape)
+                results['MHA'] = 'SUCCESS'
+            except Exception as e:
+                print("MHA error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['MHA'] = 'FAILED'
+            
+            # Test FF
+            x_ff = jnp.ones((self.batch_size, self.seq_len, self.num_experts, self.d_model))
+            try:
+                y = self.test_ff(self.ff, x_ff)
+                print("FF output shape:", y.shape)
+                results['FF'] = 'SUCCESS'
+            except Exception as e:
+                print("FF error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['FF'] = 'FAILED'
+            
+            # Test Router
+            x_router = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+            try:
+                a, b, c = self.test_router(self.router, x_router)
+                print("Router outputs:", a.shape, b.shape, c)
+                results['Router'] = 'SUCCESS'
+            except Exception as e:
+                print("Router error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['Router'] = 'FAILED'
+            
+            # Test Experts
+            x_experts = jnp.ones((self.batch_size, self.seq_len, self.d_model))
+            try:
+                y, z = self.test_experts(self.experts, x_experts)
+                print("Experts output shape and loss:", y.shape, z)
+                results['Experts'] = 'SUCCESS'
+            except Exception as e:
+                print("Experts error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['Experts'] = 'FAILED'
+            
+            # Test the full transformer
+            input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+            try:
+                logits, avg_loss = self.test_transformer(self.transformer, input_ids)
+                print("Transformer output shape and avg loss:", logits.shape, avg_loss)
+                results['Transformer'] = 'SUCCESS'
+            except Exception as e:
+                print("Transformer error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['Transformer'] = 'FAILED'
+            
+            # Print test summary
+            print("\nTest Summary:")
+            print("-" * 30)
+            for test_name, result in results.items():
+                print(f"{test_name:15} | {result}")
+            print("-" * 30)
+            successes = sum(1 for result in results.values() if result == 'SUCCESS')
+            failures = sum(1 for result in results.values() if result == 'FAILED')
+            print(f"Total: {len(results)} tests ({successes} passed, {failures} failed)")
 
 if __name__ == "__main__":
     test = Test()
