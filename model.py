@@ -286,21 +286,16 @@ class Router(nnx.Module):
         
         loss = None
         if self.training:
-            # Compute z-loss per batch and keep batch dimension
-            z_loss_per_batch = jnp.mean(nnx.logsumexp(gating_logits, axis=-1) ** 2, axis=1)
+            z_loss_per_batch = jnp.mean(nnx.logsumexp(gating_logits, axis=-1) ** 2, axis=1)  # shape: (batch,)
             
-            # Compute balance loss per batch and keep batch dimension
-            probs_mean_per_batch = jnp.mean(gating_probs, axis=1)
-            mask_mean_per_batch = jnp.mean(combined_expert_mask, axis=1)
-            balance_loss_per_batch = (
-                probs_mean_per_batch * mask_mean_per_batch
-            ) * (mask_mean_per_batch.shape[-1] ** 2)
-            
-            # Combine losses but keep batch dimension
-            loss = (
-                balance_loss_per_batch * self.balance_loss_coef + 
-                z_loss_per_batch * self.z_loss_coef
+            probs_mean_per_batch = jnp.mean(gating_probs, axis=1)  # shape: (batch, num_experts)
+            mask_mean_per_batch = jnp.mean(combined_expert_mask, axis=1)  # shape: (batch, num_experts)
+            balance_loss_per_batch = jnp.mean(
+                probs_mean_per_batch * mask_mean_per_batch * (mask_mean_per_batch.shape[-1] ** 2),
+                axis=-1  # Reduce over experts dimension to get shape (batch,)
             )
+            
+            loss = balance_loss_per_batch * self.balance_loss_coef + z_loss_per_batch * self.z_loss_coef
         
         position_in_expert = jnp.cumsum(expert_mask, axis=1) * expert_mask
         valid_assignment = jnp.less(position_in_expert, expert_capacity)
