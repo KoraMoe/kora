@@ -644,7 +644,10 @@ class Block(nnx.Module):
         attn_norm_x = self.attn_norm(x)
         
         # Attention with residual connection
-        attn_output = self.attention(attn_norm_x, attn_mask)
+        if self.use_gradient_checkpointing:
+            attn_output = nnx.remat(self.attention)(attn_norm_x, attn_mask)
+        else:
+            attn_output = self.attention(attn_norm_x, attn_mask)
         x = x + attn_output
         
         # Pre-normalization for MoE
@@ -657,8 +660,6 @@ class Block(nnx.Module):
         return x, router_loss
     
     def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
-        if self.use_gradient_checkpointing:
-            return nnx.remat(self.forward)(x, attn_mask)
         return self.forward(x, attn_mask)
 
 class Transformer(nnx.Module):

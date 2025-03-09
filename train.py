@@ -480,9 +480,9 @@ def main():
         for step in range(start_step, total_steps):
             batch = train_loader.next()
 
-            if step == 10:
+            if step == 20:
                 jax.profiler.start_trace("train_step", create_perfetto_trace=True)
-            elif step == 20:
+            elif step == 30:
                 jax.profiler.stop_trace()
             
             loss = train_step(model, optimizer, train_metrics, batch)
