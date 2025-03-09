@@ -14,7 +14,7 @@ TOKENIZER_NAME = "gpt2"
 CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
 LOG_STEPS = 10
 EVAL_STEPS = 5000
-MESH_SHAPE = (8, 2)  # (data, expert)
+MESH_SHAPE = (2, 8)  # (data, expert)
 
 VOCAB_SIZE = 50257
 VOCAB_SIZE = ((VOCAB_SIZE + 127) // 128) * 128
