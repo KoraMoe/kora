@@ -196,8 +196,8 @@ class FeedForward(nnx.Module):
         self.act = nnx.gelu
     
     def process_by_indices(self, x: jnp.ndarray, indices: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
-        selected_keys = self.keys.value[indices, :]
-        selected_values = self.values.value[indices, :]
+        selected_keys = self.keys.value[indices]
+        selected_values = self.values.value[indices]
         selected_key_bias = self.key_bias.value[indices]
         selected_value_bias = self.value_bias.value[indices]
 
@@ -219,15 +219,15 @@ class FeedForward(nnx.Module):
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         # Add sharding hints for expert-parallel computation
         x = jax.lax.with_sharding_constraint(
-            x, jax.sharding.PartitionSpec('expert', 'data', None, None)
+            x, jax.sharding.PartitionSpec('data', 'expert', None, None)
         )
         
-        hidden = jnp.einsum('ebsd,edh->ebsh', x, self.keys.value)
-        hidden = hidden + self.key_bias.value[:, None, None, :]
+        hidden = jnp.einsum('besd,edh->besh', x, self.keys.value)
+        hidden = hidden + self.key_bias.value[None, :, None, :]
         hidden = self.act(hidden)
         
-        output = jnp.einsum('ebsh,ehd->ebsd', hidden, self.values.value)
-        output = output + self.value_bias.value[:, None, None, :]
+        output = jnp.einsum('besh,ehd->besd', hidden, self.values.value)
+        output = output + self.value_bias.value[None, :, None, :]
         
         return output
 
@@ -423,9 +423,9 @@ class MixtureLayer(nnx.Module):
         if not self.num_shared_experts:
             return jnp.zeros_like(x)
         
-        x_expanded = x[None, :, :, :]
-        shared_outputs = self.shared_experts(x_expanded)  # [num_shared_experts, batch, seq, d_model]
-        output = jnp.mean(shared_outputs, axis=0)  # [batch, seq, d_model]
+        x_expanded = x[:, None, :, :]
+        shared_outputs = self.shared_experts(x_expanded)
+        output = jnp.mean(shared_outputs, axis=1)
 
         return output
     
@@ -516,8 +516,8 @@ class MixtureLayer(nnx.Module):
             # ff_dispatch: [groups, size, experts, capacity]
             # x_grouped: [groups, size, d_model]
             dispatch_to_expert = jax.lax.with_sharding_constraint(
-                jnp.einsum('gsec,gsd->egsd', ff_dispatch, x_grouped),
-                jax.sharding.PartitionSpec('expert', 'data', None, None)
+                jnp.einsum('gsec,gsd->gesd', ff_dispatch, x_grouped),
+                jax.sharding.PartitionSpec('data', 'expert', None, None)
             )
 
             # 2. Process with experts (already sharded on expert dimension)
@@ -527,7 +527,7 @@ class MixtureLayer(nnx.Module):
             # ff_combine: [groups, size, experts, capacity]
             # expert_outputs: [experts, groups, size, d_model]
             combine_from_expert = jax.lax.with_sharding_constraint(
-                jnp.einsum('egsd,gsec->gsd', expert_outputs, ff_combine),
+                jnp.einsum('gesd,gsec->gsd', expert_outputs, ff_combine),
                 jax.sharding.PartitionSpec('data', None, None)
             )
 
@@ -856,7 +856,7 @@ class Test():
                 results['MHA'] = 'FAILED'
             
             # Test FF
-            x_ff = jnp.ones((self.batch_size, self.seq_len, self.num_experts, self.d_model))
+            x_ff = jnp.ones((self.batch_size, self.num_experts, self.seq_len, self.d_model))
             try:
                 y = self.test_ff(self.ff, x_ff)
                 print("FF output shape:", y.shape)

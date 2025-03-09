@@ -485,7 +485,9 @@ def main():
             elif step == 20:
                 jax.profiler.stop_trace()
             
-            train_step(model, optimizer, train_metrics, batch)
+            loss = train_step(model, optimizer, train_metrics, batch)
+            progress_bar.update(1)
+            progress_bar.set_description(f"Training <{loss:.4f}>")
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
                 metrics_values = train_metrics.compute()
@@ -496,7 +498,6 @@ def main():
                         'ppl': f"{metrics_values['perplexity']:.4f}",
                         'lr': f"{lr_schedule(step):.6f}"
                 })
-                progress_bar.update(LOG_STEPS)
             
             # Evaluate and save checkpoint periodically
             if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
