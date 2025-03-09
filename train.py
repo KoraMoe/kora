@@ -155,7 +155,7 @@ def create_learning_rate_schedule(
     )
 
 class BatchLoader:
-    def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 6):
+    def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 4):
         self.dataset = dataset
         self.global_batch_size = batch_size
         self.data_spec = data_spec
