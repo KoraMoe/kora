@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import os
 
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 NUM_EPOCHS = 10
 LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500
