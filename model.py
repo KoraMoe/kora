@@ -177,19 +177,9 @@ class FeedForward(nnx.Module):
             sharding=('expert', None, None),
             dtype=self.dtype,
         )
-        self.key_bias = nnx.Param(
-            jnp.zeros((self.num_experts, self.hidden_dim)),
-            sharding=('expert', None),
-            dtype=self.dtype,
-        )
         self.values = nnx.Param(
             init_fn(key, (self.num_experts, self.hidden_dim, self.d_model)),
             sharding=('expert', None, None),
-            dtype=self.dtype,
-        )
-        self.value_bias = nnx.Param(
-            jnp.zeros((self.num_experts, self.d_model)),
-            sharding=('expert', None),
             dtype=self.dtype,
         )
 
@@ -198,21 +188,15 @@ class FeedForward(nnx.Module):
     def process_by_indices(self, x: jnp.ndarray, indices: jnp.ndarray, weights: jnp.ndarray) -> jnp.ndarray:
         selected_keys = self.keys.value[indices]
         selected_values = self.values.value[indices]
-        selected_key_bias = self.key_bias.value[indices]
-        selected_value_bias = self.value_bias.value[indices]
 
         # [batch, seq, d_model] @ [batch, seq, top_k, d_model, hidden_dim] -> [batch, seq, top_k, hidden_dim]
         hidden = jnp.einsum('bsd,bskdh->bskh', x, selected_keys)
         
         # Add bias and apply activation
-        hidden = hidden + selected_key_bias
         hidden = self.act(hidden)
         
         # [batch, seq, top_k, hidden_dim] @ [batch, seq, top_k, d_model] -> [batch, seq, d_model]
         output = jnp.einsum('bskh,bskhd,bsk->bsd', hidden, selected_values, weights)
-        weighted_bias = jnp.sum(selected_value_bias * jnp.expand_dims(weights, axis=-1), axis=2)
-        # Add bias
-        output = output + weighted_bias
         
         return output
 
@@ -221,13 +205,18 @@ class FeedForward(nnx.Module):
         x = jax.lax.with_sharding_constraint(
             x, jax.sharding.PartitionSpec('data', 'expert', None, None)
         )
-        
-        hidden = jnp.einsum('besd,edh->besh', x, self.keys.value)
-        hidden = hidden + self.key_bias.value[None, :, None, :]
+
+        hidden = jax.lax.with_sharding_constraint(
+            jnp.einsum('besd,edh->besh', x, self.keys.value),
+            jax.sharding.PartitionSpec('data', 'expert', None, None)
+        )
+
         hidden = self.act(hidden)
         
-        output = jnp.einsum('besh,ehd->besd', hidden, self.values.value)
-        output = output + self.value_bias.value[None, :, None, :]
+        output = jax.lax.with_sharding_constraint(
+            jnp.einsum('besh,ehd->besd', hidden, self.values.value),
+            jax.sharding.PartitionSpec('data', 'expert', None, None)
+        )
         
         return output
 
@@ -263,15 +252,21 @@ class Router(nnx.Module):
             dtype=self.dtype,
         )
         self.gate_bias = nnx.Param(
-            jnp.zeros((self.num_experts,)),
-            sharding=(None,),
+            jnp.zeros((1, 1, self.num_experts), dtype=self.dtype),
+            sharding=(None, None, None),
             dtype=self.dtype,
         )
 
     def __call__(self, x: jnp.ndarray, expert_capacity: int | None = None) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None]:
         # x shape: (groups, size, d_model)
-        gating_logits = jnp.einsum('gsd,de->gse', x, self.gate_weight.value)
-        gating_logits = gating_logits + self.gate_bias[None, None, :]
+        x = jax.lax.with_sharding_constraint(
+            x, jax.sharding.PartitionSpec('data', None, None)
+        )
+        gating_logits = jax.lax.with_sharding_constraint(
+            jnp.einsum('gsd,de->gse', x, self.gate_weight.value),
+            jax.sharding.PartitionSpec('data', None, None)
+        )
+        gating_logits = gating_logits + self.gate_bias
         
         gating_probs = nnx.softmax(gating_logits)
         expert_gate, expert_index = jax.lax.top_k(gating_probs, self.top_k)
@@ -304,6 +299,11 @@ class Router(nnx.Module):
         )
         
         # Sum across top_k dimension to get final combine tensor
+        # shape: (groups, size, experts, capacity)
+        combine_tensor_per_assignment = jax.lax.with_sharding_constraint(
+            combine_tensor_per_assignment,
+            jax.sharding.PartitionSpec('data', None, None, None)
+        )
         combine_tensor = jnp.sum(combine_tensor_per_assignment, axis=2)
         
         # Remove the first position (zero position) from capacity dimension
