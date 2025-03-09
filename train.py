@@ -191,7 +191,7 @@ class BatchLoader:
         batch_data = self.dataset[valid_indices]
         
         for k, v in batch_data.items():
-            array = np.array(v, dtype=jnp.int16)
+            array = np.array(v, dtype=jnp.int32)
             examples[k] = jax.make_array_from_process_local_data(
                 self.data_spec,
                 array
