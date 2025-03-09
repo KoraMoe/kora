@@ -1,4 +1,6 @@
 import os
+import queue
+import threading
 
 from config import *
 import numpy as np
@@ -153,7 +155,6 @@ def create_learning_rate_schedule(
     )
 
 class BatchLoader:
-    """Efficient batch loader using generators for prefetching with data sharding across processes."""
     def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 3):
         self.dataset = dataset
         self.global_batch_size = batch_size
@@ -180,8 +181,12 @@ class BatchLoader:
         # Initial shuffle with base seed
         self._shuffle_indices()
         
-        # Initialize the generator
-        self._iterator = self._batch_generator()
+        # Initialize threading components
+
+        self._queue = queue.Queue(maxsize=num_prefetch)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._producer_thread, daemon=True)
+        self._thread.start()
     
     def _create_batch(self, indices):
         """Create a sharded batch from indices for the current process."""
@@ -210,41 +215,44 @@ class BatchLoader:
         # Calculate process-specific shard of indices
         shard_size = len(all_indices) // self.num_processes
         start_idx = self.process_id * shard_size
-        end_idx = start_idx + shard_size if self.process_id < self.num_processes - 1 else len(all_indices)
+        end_idx = start_idx + shard_size
         
         # Get process-specific indices
         self.indices = all_indices[start_idx:end_idx]
         self.current_idx = 0
         self.current_epoch += 1
     
-    def _batch_generator(self):
-        """Generator that yields batches with prefetching."""
-        from collections import deque
-        
-        # Create a deque for prefetching
-        prefetch_queue = deque(maxlen=self.num_prefetch)
-        
-        def get_next_batch():
-            if self.current_idx + self.local_batch_size > len(self.indices):
-                self._shuffle_indices()
-            
-            # Get local batch indices for this process
-            batch_indices = self.indices[self.current_idx:self.current_idx + self.local_batch_size]
-            self.current_idx += self.local_batch_size
-            return self._create_batch(batch_indices)
-        
-        # Initial prefetch
-        for _ in range(self.num_prefetch):
-            prefetch_queue.append(get_next_batch())
-        
-        # Main loop
-        while True:
-            yield prefetch_queue.popleft()
-            prefetch_queue.append(get_next_batch())
+    def _producer_thread(self):
+        """Producer thread that continuously generates batches and puts them in the queue."""
+        try:
+            while not self._stop_event.is_set():
+                if self.current_idx + self.local_batch_size > len(self.indices):
+                    self._shuffle_indices()
+                
+                # Get local batch indices for this process
+                batch_indices = self.indices[self.current_idx:self.current_idx + self.local_batch_size]
+                self.current_idx += self.local_batch_size
+                
+                # Create batch and put in queue
+                batch = self._create_batch(batch_indices)
+                self._queue.put(batch)
+        except Exception as e:
+            import traceback
+            print(f"Error in producer thread: {str(e)}")
+            print(traceback.format_exc())
+            self._stop_event.set()
     
     def next(self):
-        """Get next batch from the generator."""
-        return next(self._iterator)
+        """Get next batch from the queue."""
+        if self._stop_event.is_set():
+            raise RuntimeError("Producer thread encountered an error")
+        return self._queue.get()
+    
+    def __del__(self):
+        """Cleanup when the loader is destroyed."""
+        self._stop_event.set()
+        if hasattr(self, '_thread'):
+            self._thread.join(timeout=1.0)
 
 def count_params(model: Transformer) -> float:
     """Count total number of trainable parameters in billions."""
@@ -369,7 +377,7 @@ def load_checkpoint(
                 batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             
             # Reinitialize the generator with the restored state
-            batch_loader._iterator = batch_loader._batch_generator()
+            batch_loader._producer_thread()
             
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
@@ -378,7 +386,7 @@ def load_checkpoint(
             batch_loader.current_epoch = 0
             batch_loader.current_idx = 0
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader._iterator = batch_loader._batch_generator()
+            batch_loader._producer_thread()
     
     return restored["step"], restored.get("metrics", {})
 

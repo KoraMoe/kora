@@ -13,4 +13,6 @@ dependencies = [
     "transformers>=4.49.0",
     "libtpu>=0.0.10.1; sys_platform != 'darwin'",
     "matplotlib>=3.10.1",
+    "tensorflow>=2.18.0",
+    "tensorboard-plugin-profile>=2.19.0",
 ]
