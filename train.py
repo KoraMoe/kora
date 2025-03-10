@@ -19,7 +19,7 @@ import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 
-@nnx.jit
+@nnx.jit(static_argnames=['tokenizer', 'prompt', 'max_new_tokens'])
 def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50):
     """Generate text using greedy search."""
     # Tokenize prompt
@@ -62,7 +62,9 @@ def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me"
     
     # Get generated sequence
     generated_ids = padded_ids[:, :current_length]
-    return generated_ids[0]
+    generated_text = tokenizer.decode(generated_ids[0])
+    
+    return generated_text
 
 def block_all(xs):
     jax.tree_util.tree_map(lambda x: x.block_until_ready(), xs)
@@ -543,8 +545,7 @@ def main():
             
             if step  % SAMPLE_STEPS == 0:
                 print(f"\nSampling text at step {step + 1}:")
-                generated_ids = greedy_sample(model, tokenizer)
-                generated_text = tokenizer.decode(generated_ids)
+                generated_text = greedy_sample(model, tokenizer)
                 print(f"Generated: {generated_text}\n")
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
