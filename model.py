@@ -3,8 +3,8 @@ import jax.numpy as jnp
 from flax import nnx
 from functools import partial
 
-@partial(nnx.vmap, in_axes=(0, None, 0))
-@partial(nnx.vmap, in_axes=(0, None, None))
+@partial(nnx.vmap, in_axes=(0, None, 0, None))
+@partial(nnx.vmap, in_axes=(0, None, None, None))
 def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
     if is_causal:
         row_idx = jnp.arange(seq_len)[None, :]
@@ -125,6 +125,7 @@ class MultiHeadAttention(nnx.Module):
         head_dim: int,
         dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
+        need_attention_mask: bool = True,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
@@ -133,6 +134,7 @@ class MultiHeadAttention(nnx.Module):
         self.head_dim = head_dim
         self.dtype = dtype
         self.training = training
+        self.need_attention_mask = need_attention_mask
         
         key = rngs.params()
         
@@ -172,10 +174,11 @@ class MultiHeadAttention(nnx.Module):
         scores = jnp.einsum('bnqd,bnkd->bnqk', q, k) / jnp.sqrt(self.head_dim)
         
         # Handle both causal and attention masking in one step
-        if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
-            if attn_mask.shape[1] > seq_len:
-                attn_mask = attn_mask[:, :seq_len]
-        scores = _apply_mask(scores, seq_len, attn_mask, is_causal)
+        if self.need_attention_mask:
+            if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
+                if attn_mask.shape[1] > seq_len:
+                    attn_mask = attn_mask[:, :seq_len]
+            scores = _apply_mask(scores, seq_len, attn_mask, is_causal)
 
         attn_weights = nnx.softmax(scores, axis=-1)
 
@@ -625,6 +628,7 @@ class Block(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         use_gradient_checkpointing: bool = False,
+        need_attention_mask: bool = True,
         init_fn = None,
         layer_idx: int = 0,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -645,6 +649,7 @@ class Block(nnx.Module):
         self.training = training
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.layer_idx = layer_idx
+        self.need_attention_mask = need_attention_mask
         
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
@@ -660,6 +665,7 @@ class Block(nnx.Module):
             head_dim=self.head_dim,
             dtype=self.dtype,
             training=self.training,
+            need_attention_mask=self.need_attention_mask,
             init_fn=init_fn,
             rngs=rngs
         )
@@ -724,6 +730,7 @@ class Transformer(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         use_gradient_checkpointing: bool = False,
+        need_attention_mask: bool = True,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
@@ -744,6 +751,7 @@ class Transformer(nnx.Module):
         self.dtype = dtype
         self.training = training
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.need_attention_mask = need_attention_mask
 
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
@@ -776,6 +784,7 @@ class Transformer(nnx.Module):
                 dtype=self.dtype,
                 training=self.training,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
+                need_attention_mask=self.need_attention_mask,
                 init_fn=init_fn,
                 layer_idx=layer_idx,
                 rngs=rngs
