@@ -126,6 +126,7 @@ class MultiHeadAttention(nnx.Module):
         dtype: jnp.dtype = jnp.bfloat16,
         training: bool = False,
         need_attention_mask: bool = True,
+        is_causal: bool = True,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
@@ -135,6 +136,7 @@ class MultiHeadAttention(nnx.Module):
         self.dtype = dtype
         self.training = training
         self.need_attention_mask = need_attention_mask
+        self.is_causal = is_causal
         
         key = rngs.params()
         
@@ -159,7 +161,7 @@ class MultiHeadAttention(nnx.Module):
             dtype=self.dtype,
         )
     
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
         batch_size, seq_len, _ = x.shape
 
         qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value) # reduce
@@ -178,7 +180,7 @@ class MultiHeadAttention(nnx.Module):
             if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
                 if attn_mask.shape[1] > seq_len:
                     attn_mask = attn_mask[:, :seq_len]
-            scores = _apply_mask(scores, seq_len, attn_mask, is_causal)
+            scores = _apply_mask(scores, seq_len, attn_mask, self.is_causal)
 
         attn_weights = nnx.softmax(scores, axis=-1)
 
@@ -629,6 +631,7 @@ class Block(nnx.Module):
         training: bool = False,
         use_gradient_checkpointing: bool = False,
         need_attention_mask: bool = True,
+        is_causal: bool = True,
         init_fn = None,
         layer_idx: int = 0,
         rngs: nnx.Rngs = nnx.Rngs()
@@ -650,7 +653,7 @@ class Block(nnx.Module):
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.layer_idx = layer_idx
         self.need_attention_mask = need_attention_mask
-        
+        self.is_causal = is_causal
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
         
@@ -666,6 +669,7 @@ class Block(nnx.Module):
             dtype=self.dtype,
             training=self.training,
             need_attention_mask=self.need_attention_mask,
+            is_causal=self.is_causal,
             init_fn=init_fn,
             rngs=rngs
         )
@@ -688,15 +692,15 @@ class Block(nnx.Module):
             rngs=rngs
         )
         
-    def forward(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    def forward(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
         # Pre-normalization for attention
         attn_norm_x = self.attn_norm(x)
         
         # Attention with residual connection
         if self.use_gradient_checkpointing:
-            attn_output = nnx.remat(self.attention)(attn_norm_x, attn_mask, is_causal)
+            attn_output = nnx.remat(self.attention)(attn_norm_x, attn_mask)
         else:
-            attn_output = self.attention(attn_norm_x, attn_mask, is_causal)
+            attn_output = self.attention(attn_norm_x, attn_mask)
         x = x + attn_output
         
         # Pre-normalization for MoE
@@ -708,10 +712,10 @@ class Block(nnx.Module):
         
         return x, router_loss
     
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray | None]:
-        return self.forward(x, attn_mask, is_causal)
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        return self.forward(x, attn_mask)
 
-class Transformer(nnx.Module):
+class LLM(nnx.Module):
     def __init__(self,
         d_model: int,
         hidden_dim: int,
@@ -731,6 +735,7 @@ class Transformer(nnx.Module):
         training: bool = False,
         use_gradient_checkpointing: bool = False,
         need_attention_mask: bool = True,
+        is_causal: bool = True,
         init_fn = None,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
@@ -752,6 +757,7 @@ class Transformer(nnx.Module):
         self.training = training
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.need_attention_mask = need_attention_mask
+        self.is_causal = is_causal
 
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
@@ -785,6 +791,7 @@ class Transformer(nnx.Module):
                 training=self.training,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 need_attention_mask=self.need_attention_mask,
+                is_causal=self.is_causal,
                 init_fn=init_fn,
                 layer_idx=layer_idx,
                 rngs=rngs
@@ -801,7 +808,7 @@ class Transformer(nnx.Module):
             dtype=self.dtype,
         )
         
-    def __call__(self, input_ids: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, input_ids: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
 
         x = self.token_embedding[input_ids]
         
@@ -812,7 +819,7 @@ class Transformer(nnx.Module):
         for i, block in enumerate(self.blocks):
             # During inference, don't track losses at all
             if not self.training:
-                x, _ = block(x, attn_mask, is_causal)
+                x, _ = block(x, attn_mask)
             else:
                 x, block_loss = block(x, attn_mask)
                 # In training mode, always accumulate losses
@@ -827,6 +834,106 @@ class Transformer(nnx.Module):
         router_loss /= self.num_layers
         
         return logits, router_loss
+
+class DiffusionLLM(nnx.Module):
+    def __init__(self,
+        d_model: int,
+        hidden_dim: int,
+        num_layers: int,
+        num_heads: int,
+        head_dim: int,
+        vocab_size: int,
+        num_experts: int = 8,
+        num_shared_experts: int = 1,
+        top_k: int = 2,
+        capacity_factor: float = 2.0,
+        min_expert_capacity: int = 8,
+        max_group_size: int = 4096,
+        router_z_loss_coef: float = 1e-3,
+        router_balance_loss_coef: float = 1e-4,
+        dtype: jnp.dtype = jnp.bfloat16,
+        training: bool = False,
+        use_gradient_checkpointing: bool = False,
+        need_attention_mask: bool = False,
+        init_fn = None,
+        rngs: nnx.Rngs = nnx.Rngs()
+    ):
+        self.d_model = d_model
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.vocab_size = vocab_size
+        self.num_experts = num_experts
+        self.num_shared_experts = num_shared_experts
+        self.top_k = top_k
+        self.capacity_factor = capacity_factor
+        self.min_expert_capacity = min_expert_capacity
+        self.max_group_size = max_group_size
+        self.router_z_loss_coef = router_z_loss_coef
+        self.router_balance_loss_coef = router_balance_loss_coef
+        self.dtype = dtype
+        self.training = training
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.need_attention_mask = need_attention_mask
+
+        if init_fn is None:
+            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+        
+        key = rngs.params()
+        
+        self.text_head = nnx.Param(
+            init_fn(key, (self.vocab_size, self.d_model)),
+            sharding=(None, None),
+            dtype=self.dtype,
+        )
+        
+        self.blocks = [
+            Block(
+                d_model=self.d_model,
+                hidden_dim=self.hidden_dim,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                num_experts=self.num_experts,
+                num_shared_experts=self.num_shared_experts,
+                top_k=self.top_k,
+                capacity_factor=self.capacity_factor,
+                min_expert_capacity=self.min_expert_capacity,
+                max_group_size=self.max_group_size,
+                router_z_loss_coef=self.router_z_loss_coef,
+                router_balance_loss_coef=self.router_balance_loss_coef,
+                dtype=self.dtype,
+                training=self.training,
+                use_gradient_checkpointing=self.use_gradient_checkpointing,
+                need_attention_mask=self.need_attention_mask,
+                is_causal=False,
+                init_fn=init_fn,
+                layer_idx=layer_idx,
+                rngs=rngs
+            ) for layer_idx in range(self.num_layers)
+        ]
+        
+        self.final_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+    
+    def encode(self, input_ids: jnp.ndarray) -> jnp.ndarray:
+        return self.text_head[input_ids]
+
+    def decode(self, x: jnp.ndarray) -> jnp.ndarray:
+        return jnp.einsum('btd,vd->btv', x, self.text_head)
+
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        router_loss = jnp.zeros((), dtype=self.dtype)
+        for i, block in enumerate(self.blocks):
+            if not self.training:
+                x, _ = block(x, attn_mask)
+            else:
+                x, block_loss = block(x, attn_mask)
+                router_loss += block_loss
+        
+        x = self.final_norm(x)
+        router_loss /= self.num_layers
+        return x, router_loss
+    
 
 class Test():
     def __init__(self):
@@ -849,7 +956,20 @@ class Test():
         self.experts = MixtureLayer(self.d_model, self.hidden_dim, self.num_experts, self.num_shared_experts, training=True, rngs=rngs)
         self.mesh = jax.make_mesh((1, 1), ('expert', 'data'))
         # Add full transformer model
-        self.transformer = Transformer(
+        self.llm = LLM(
+            d_model=self.d_model,
+            hidden_dim=self.hidden_dim,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            vocab_size=self.vocab_size,
+            num_experts=self.num_experts,
+            num_shared_experts=self.num_shared_experts,
+            training=True,
+            rngs=rngs
+        )
+
+        self.diffusion_llm = DiffusionLLM(
             d_model=self.d_model,
             hidden_dim=self.hidden_dim,
             num_layers=self.num_layers,
@@ -887,6 +1007,11 @@ class Test():
     @staticmethod
     @nnx.jit
     def test_transformer(module, input_ids):
+        return module(input_ids)
+    
+    @staticmethod
+    @nnx.jit
+    def test_diffusion_llm(module, input_ids):
         return module(input_ids)
 
     def __call__(self):
@@ -947,7 +1072,7 @@ class Test():
             # Test the full transformer
             input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
             try:
-                logits, avg_loss = self.test_transformer(self.transformer, input_ids)
+                logits, avg_loss = self.test_transformer(self.llm, input_ids)
                 print("Transformer output shape and avg loss:", logits.shape, avg_loss)
                 results['Transformer'] = 'SUCCESS'
             except Exception as e:
@@ -955,6 +1080,18 @@ class Test():
                 print("Stack trace:")
                 traceback.print_exc()
                 results['Transformer'] = 'FAILED'
+            
+            # Test Diffusion LLM
+            input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+            try:
+                logits, avg_loss = self.test_diffusion_llm(self.diffusion_llm, input_ids)
+                print("Diffusion LLM output shape and avg loss:", logits.shape, avg_loss)
+                results['Diffusion LLM'] = 'SUCCESS'
+            except Exception as e:
+                print("Diffusion LLM error:", e)
+                print("Stack trace:")
+                traceback.print_exc()
+                results['Diffusion LLM'] = 'FAILED'
             
             # Print test summary
             print("\nTest Summary:")
