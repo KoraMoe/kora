@@ -5,10 +5,13 @@ from functools import partial
 
 @partial(nnx.vmap, in_axes=(0, None, 0))
 @partial(nnx.vmap, in_axes=(0, None, None))
-def _apply_causal_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
-    row_idx = jnp.arange(seq_len)[None, :]
-    col_idx = jnp.arange(seq_len)[:, None]
-    causal_mask = row_idx <= col_idx
+def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
+    if is_causal:
+        row_idx = jnp.arange(seq_len)[None, :]
+        col_idx = jnp.arange(seq_len)[:, None]
+        causal_mask = row_idx <= col_idx
+    else:
+        causal_mask = jnp.ones((seq_len, seq_len), dtype=bool)
     
     if attn_mask is not None:
         mask = jnp.logical_and(
@@ -154,7 +157,7 @@ class MultiHeadAttention(nnx.Module):
             dtype=self.dtype,
         )
     
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
         batch_size, seq_len, _ = x.shape
 
         qkv = jnp.einsum('bsd,tdhm->tbshm', x, self.in_proj.value) # reduce
@@ -172,7 +175,7 @@ class MultiHeadAttention(nnx.Module):
         if attn_mask is not None and attn_mask.ndim == 2 and attn_mask.shape[0] == batch_size:
             if attn_mask.shape[1] > seq_len:
                 attn_mask = attn_mask[:, :seq_len]
-        scores = _apply_causal_mask(scores, seq_len, attn_mask)
+        scores = _apply_mask(scores, seq_len, attn_mask, is_causal)
 
         attn_weights = nnx.softmax(scores, axis=-1)
 
@@ -679,15 +682,15 @@ class Block(nnx.Module):
             rngs=rngs
         )
         
-    def forward(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+    def forward(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray | None]:
         # Pre-normalization for attention
         attn_norm_x = self.attn_norm(x)
         
         # Attention with residual connection
         if self.use_gradient_checkpointing:
-            attn_output = nnx.remat(self.attention)(attn_norm_x, attn_mask)
+            attn_output = nnx.remat(self.attention)(attn_norm_x, attn_mask, is_causal)
         else:
-            attn_output = self.attention(attn_norm_x, attn_mask)
+            attn_output = self.attention(attn_norm_x, attn_mask, is_causal)
         x = x + attn_output
         
         # Pre-normalization for MoE
@@ -699,8 +702,8 @@ class Block(nnx.Module):
         
         return x, router_loss
     
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray | None]:
-        return self.forward(x, attn_mask)
+    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray | None]:
+        return self.forward(x, attn_mask, is_causal)
 
 class Transformer(nnx.Module):
     def __init__(self,
@@ -789,7 +792,7 @@ class Transformer(nnx.Module):
             dtype=self.dtype,
         )
         
-    def __call__(self, input_ids: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def __call__(self, input_ids: jnp.ndarray, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> tuple[jnp.ndarray, jnp.ndarray]:
 
         x = self.token_embedding[input_ids]
         
@@ -800,7 +803,7 @@ class Transformer(nnx.Module):
         for i, block in enumerate(self.blocks):
             # During inference, don't track losses at all
             if not self.training:
-                x, _ = block(x, attn_mask)
+                x, _ = block(x, attn_mask, is_causal)
             else:
                 x, block_loss = block(x, attn_mask)
                 # In training mode, always accumulate losses
