@@ -11,6 +11,7 @@ from jax.sharding import PartitionSpec as PS, NamedSharding as NS
 from flax import nnx
 import optax
 
+import wandb
 from model import Transformer
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -213,7 +214,7 @@ def create_learning_rate_schedule(
     )
 
 class BatchLoader:
-    def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 4):
+    def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 6):
         self.dataset = dataset
         self.global_batch_size = batch_size
         self.data_spec = data_spec
@@ -453,6 +454,22 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
     jax.distributed.initialize()
+
+    if jax.process_index() == 0:
+        wandb.init(
+            project="kora-moe",
+            config={
+                "context_length": CONTEXT_LENGTH,
+                "batch_size": BATCH_SIZE,
+                "num_epochs": NUM_EPOCHS,
+                "learning_rate": LEARNING_RATE,
+                "warmup_steps": WARMUP_STEPS,
+                "gradient_clip_norm": GRADIENT_CLIP_NORM,
+                "dtype": str(DTYPE),
+                "model_config": MODEL_CONFIG,
+            }
+        )
+    
     print(f"Process {jax.process_index()}: Initialized distributed runtime")
     sync_global_devices("distributed_init")
 
@@ -561,6 +578,14 @@ def main():
                         'ppl': f"{metrics_values['perplexity']:.4f}",
                         'lr': f"{lr_schedule(step):.6f}"
                 })
+
+                if jax.process_index() == 0:
+                    wandb.log({
+                        f"train/{k}": v for k, v in metrics_values.items()
+                    } | {
+                        'train/step': step,
+                        'train/epoch': step / steps_per_epoch
+                    })
             
             # Evaluate and save checkpoint periodically
             if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
@@ -582,6 +607,13 @@ def main():
                     best_eval_loss = eval_loss
                     print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
                 
+                if jax.process_index() == 0:
+                    wandb.log({
+                        f"eval/{k}": v for k, v in eval_results.items()
+                    } | {
+                        'eval/step': step,
+                        'eval/epoch': step / steps_per_epoch
+                    })
                 # Save checkpoint with metrics
                 metrics = {
                     "train": metrics_values,

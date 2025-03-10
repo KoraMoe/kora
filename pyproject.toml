@@ -15,4 +15,5 @@ dependencies = [
     "matplotlib>=3.10.1",
     "tensorflow>=2.18.0",
     "tensorboard-plugin-profile>=2.19.0",
+    "wandb>=0.19.8",
 ]
