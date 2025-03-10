@@ -20,6 +20,35 @@ def _apply_causal_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.n
     
     return jnp.where(mask, score_matrix, -1e9)
 
+def orthogonal_init(scale=1.0):
+    """Create an orthogonal initializer with the given scale."""
+    def init(key, shape, dtype=jnp.float32):
+        if len(shape) < 2:
+            raise ValueError("Orthogonal initialization requires at least a 2D shape")
+        
+        # Get the shape for the matrix
+        rows, cols = shape[-2:]
+        
+        # Generate a random matrix
+        key, subkey = jax.random.split(key)
+        unstructured = jax.random.normal(subkey, shape, dtype)
+        
+        # Compute the QR decomposition
+        q, r = jnp.linalg.qr(unstructured)
+        
+        # Make Q uniform
+        q = q * jnp.sign(jnp.diag(r))
+        
+        # Ensure q has the right size
+        if rows < cols:
+            q = q.T
+        
+        # Apply scaling
+        q = scale * q
+        
+        return q.astype(dtype)
+    return init
+
 class RMSNorm(nnx.Module):
     def __init__(self, 
         dim: int,
@@ -243,7 +272,7 @@ class Router(nnx.Module):
         key = rngs.params()
 
         if init_fn is None:
-            init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
+            init_fn = orthogonal_init(scale=1.0)
 
         # Replace direct parameter with linear layer including bias
         self.gate_weight = nnx.Param(
@@ -372,7 +401,6 @@ class MixtureLayer(nnx.Module):
             top_k=self.top_k,
             dtype=self.dtype,
             training=self.training,
-            init_fn=init_fn,
             rngs=rngs
         )
         
