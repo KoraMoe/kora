@@ -19,7 +19,12 @@ import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 
-@nnx.jit(static_argnames=['tokenizer', 'prompt', 'max_new_tokens'])
+@nnx.jit
+def _model_generate_step(model: Transformer, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
+    """JIT-compiled single token generation step."""
+    logits, _ = model(padded_ids, attention_mask)
+    return logits
+
 def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50):
     """Generate text using greedy search."""
     # Tokenize prompt
@@ -45,10 +50,9 @@ def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me"
     # Generate tokens
     current_length = prompt_length
     for _ in range(max_new_tokens):
-        # Forward pass with masked sequence
-        logits, _ = model(padded_ids, attention_mask)
-        
-        # Get next token (greedy)
+        # Get next token using JIT-compiled step
+        logits = _model_generate_step(model, padded_ids, attention_mask)
+
         next_token = jnp.argmax(logits[:, current_length-1], axis=-1)
         
         # Update sequence and mask
