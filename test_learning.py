@@ -6,7 +6,7 @@ from datasets import Dataset
 from config import *
 from flax import nnx
 import optax
-from train import (
+from train_llm import (
     BatchLoader, create_sharded_model,
     train_step, eval_step, create_learning_rate_schedule
 )

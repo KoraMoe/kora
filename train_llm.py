@@ -12,7 +12,7 @@ from flax import nnx
 import optax
 
 import wandb
-from model import Transformer
+from model import LLM
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from datasets import load_from_disk
@@ -21,12 +21,12 @@ from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 
 @nnx.jit
-def _model_generate_step(model: Transformer, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
+def _model_generate_step(model: LLM, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
     """JIT-compiled single token generation step."""
     logits, _ = model(padded_ids, attention_mask)
     return logits
 
-def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50):
+def greedy_sample(model: LLM, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50):
     """Generate text using greedy search."""
     # Tokenize prompt
     input_tokens = tokenizer(prompt, return_tensors="np")
@@ -99,7 +99,7 @@ def calculate_metrics(logits, labels, mask):
     return loss, accuracy, perplexity
 
 @nnx.jit
-def train_step(model: Transformer, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch):
+def train_step(model: LLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch):
 
     def loss_fn(model):
         logits, router_loss = model(batch['input_ids'], batch['attention_mask'])
@@ -132,7 +132,7 @@ def train_step(model: Transformer, optimizer: nnx.Optimizer, metrics: nnx.MultiM
     return total_loss
 
 @nnx.jit
-def eval_step(model: Transformer, metrics: nnx.MultiMetric, batch):
+def eval_step(model: LLM, metrics: nnx.MultiMetric, batch):
 
     def loss_fn(model):
         logits, router_loss = model(batch['input_ids'], batch['attention_mask'])
@@ -183,7 +183,7 @@ def load_dataset():
 
 @nnx.jit
 def create_sharded_model():
-    model = Transformer(**MODEL_CONFIG, rngs=nnx.Rngs(0))
+    model = LLM(**MODEL_CONFIG, rngs=nnx.Rngs(0))
     state = nnx.state(model)
     pspecs = nnx.get_partition_spec(state)
     sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
@@ -313,7 +313,7 @@ class BatchLoader:
         if hasattr(self, '_thread'):
             self._thread.join(timeout=1.0)
 
-def count_params(model: Transformer) -> float:
+def count_params(model: LLM) -> float:
     """Count total number of trainable parameters in billions."""
     total = 0
     state = nnx.state(model)
@@ -338,7 +338,7 @@ def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 
 
 def save_checkpoint(
     ckpt_manager: ocp.CheckpointManager, 
-    model: Transformer, 
+    model: LLM, 
     optimizer: nnx.Optimizer, 
     step: int,
     batch_loader: BatchLoader,
@@ -371,7 +371,7 @@ def save_checkpoint(
 
 def load_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
-    model: Transformer,
+    model: LLM,
     optimizer: nnx.Optimizer,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:

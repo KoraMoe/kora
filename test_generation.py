@@ -6,8 +6,8 @@ import time
 from transformers import AutoTokenizer
 from flax import nnx
 if os.path.exists('model.py'):
-    from model import Transformer
-    from train import MODEL_CONFIG, create_sharded_model
+    from model import LLM
+    from train_llm import MODEL_CONFIG, create_sharded_model
     from config import MESH_SHAPE
 #jax.config.update("jax_check_tracer_leaks", True)
 
@@ -19,7 +19,7 @@ def make_test_mesh():
     return jax.sharding.Mesh(np.array(jax.devices()[:1]).reshape(1, 1), ('data', 'expert'))
 
 @nnx.jit
-def model_step(model: Transformer, input_ids: jnp.ndarray, attention_mask: jnp.ndarray) -> jnp.ndarray:
+def model_step(model: LLM, input_ids: jnp.ndarray, attention_mask: jnp.ndarray) -> jnp.ndarray:
     """Single forward pass of the model with JIT."""
     logits, _ = model(input_ids, attention_mask)
     return logits
