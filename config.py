@@ -12,8 +12,9 @@ PARALLEL_PROCESSING = 8
 TOKENIZED_DATASET_PATH = "/mnt/data/tokenized_dataset"
 TOKENIZER_NAME = "gpt2"
 CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
-LOG_STEPS = 10
+LOG_STEPS = 50
 EVAL_STEPS = 5000
+SAMPLE_STEPS = 5000
 MESH_SHAPE = (16, 1)  # (data, expert)
 
 VOCAB_SIZE = 50257
@@ -33,7 +34,7 @@ MODEL_CONFIG = {
     'head_dim': 64,
     'vocab_size': VOCAB_SIZE,
     'num_experts': 8,
-    'num_shared_experts': 1,
+    'num_shared_experts': 2,
     'top_k': 2,
     'capacity_factor': 2.0,
     'min_expert_capacity': 8,

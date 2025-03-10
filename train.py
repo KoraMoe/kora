@@ -12,12 +12,57 @@ from flax import nnx
 import optax
 
 from model import Transformer
-
+from transformers import AutoTokenizer
 from tqdm import tqdm
 from datasets import load_from_disk
 import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
+
+@nnx.jit
+def greedy_sample(model: Transformer, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50):
+    """Generate text using greedy search."""
+    # Tokenize prompt
+    input_tokens = tokenizer(prompt, return_tensors="np")
+    input_ids = jnp.array(input_tokens["input_ids"])
+    prompt_length = input_ids.shape[1]
+    
+    # Setup generation
+    total_length = prompt_length + max_new_tokens
+    
+    # Pre-fill sequence with padding
+    padded_ids = jnp.pad(
+        input_ids,
+        ((0, 0), (0, max_new_tokens)),
+        mode='constant',
+        constant_values=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    )
+    
+    # Initialize attention mask
+    attention_mask = jnp.zeros((1, total_length))
+    attention_mask = attention_mask.at[:, :prompt_length].set(1)
+    
+    # Generate tokens
+    current_length = prompt_length
+    for _ in range(max_new_tokens):
+        # Forward pass with masked sequence
+        logits, _ = model(padded_ids, attention_mask)
+        
+        # Get next token (greedy)
+        next_token = jnp.argmax(logits[:, current_length-1], axis=-1)
+        
+        # Update sequence and mask
+        padded_ids = padded_ids.at[:, current_length].set(next_token)
+        attention_mask = attention_mask.at[:, current_length].set(1)
+        current_length += 1
+        
+        # Check for EOS
+        if next_token == tokenizer.eos_token_id:
+            break
+    
+    # Get generated sequence
+    generated_ids = padded_ids[:, :current_length]
+    return generated_ids[0]
 
 def block_all(xs):
     jax.tree_util.tree_map(lambda x: x.block_until_ready(), xs)
@@ -399,6 +444,7 @@ def load_checkpoint(
 
 def main():
     train_dataset, test_dataset = load_dataset()
+    tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
     jax.distributed.initialize()
     print(f"Process {jax.process_index()}: Initialized distributed runtime")
@@ -494,6 +540,12 @@ def main():
             
             train_step(model, optimizer, train_metrics, batch)
             progress_bar.update(1)
+            
+            if step  % SAMPLE_STEPS == 0:
+                print(f"\nSampling text at step {step + 1}:")
+                generated_ids = greedy_sample(model, tokenizer)
+                generated_text = tokenizer.decode(generated_ids)
+                print(f"Generated: {generated_text}\n")
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
                 metrics_values = train_metrics.compute()
