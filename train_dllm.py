@@ -315,7 +315,7 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
 
         t = jax.random.randint(
             key, 
-            shape=(batch_size, seq_len),  # Note the seq_len dimension
+            shape=(batch_size, seq_len),
             minval=0, 
             maxval=model.timesteps, 
             dtype=jnp.int32
@@ -326,15 +326,13 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
 
         predicted_noise, router_loss = model(x_t, t, attn_mask=attention_mask)
 
-        t_mask = (t > 0).astype(predicted_noise.dtype)[..., None]
+        # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
+        loss_mask = (t > 0).astype(predicted_noise.dtype)[..., None] * attention_mask[..., None]
         
-        target_noise = noise * t_mask
-        
-        valid_mask = attention_mask[..., None].astype(predicted_noise.dtype)
-        
-        noise_loss = jnp.mean(
-            valid_mask * ((predicted_noise - target_noise) ** 2)
-        )
+        # Only compute loss for non-zero timesteps and valid tokens
+        noise_loss = jnp.sum(
+            loss_mask * ((predicted_noise - noise) ** 2)
+        ) / (jnp.sum(loss_mask) + 1e-8)  # Add small epsilon to avoid division by zero
 
         total_loss = noise_loss + jnp.mean(router_loss)
         
@@ -378,13 +376,13 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
 
         predicted_noise, router_loss = model(x_t, t, attn_mask=attention_mask)
 
-        t_mask = (t > 0).astype(predicted_noise.dtype)[..., None]
-        target_noise = noise * t_mask
-        valid_mask = attention_mask[..., None].astype(predicted_noise.dtype)
+        # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
+        loss_mask = (t > 0).astype(predicted_noise.dtype)[..., None] * attention_mask[..., None]
         
-        noise_loss = jnp.mean(
-            valid_mask * ((predicted_noise - target_noise) ** 2)
-        )
+        # Only compute loss for non-zero timesteps and valid tokens
+        noise_loss = jnp.sum(
+            loss_mask * ((predicted_noise - noise) ** 2)
+        ) / (jnp.sum(loss_mask) + 1e-8)  # Add small epsilon to avoid division by zero
 
         total_loss = noise_loss + jnp.mean(router_loss)
         
