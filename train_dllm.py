@@ -342,7 +342,7 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
             valid_mask * ((predicted_noise - target_noise) ** 2)
         )
 
-        total_loss = noise_loss + router_loss
+        total_loss = noise_loss + jnp.mean(router_loss)
         
         return total_loss, (noise_loss, router_loss)
 
@@ -392,7 +392,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
             valid_mask * ((predicted_noise - target_noise) ** 2)
         )
 
-        total_loss = noise_loss + router_loss
+        total_loss = noise_loss + jnp.mean(router_loss)
         
         return total_loss, (noise_loss, router_loss)
     
