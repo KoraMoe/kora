@@ -140,10 +140,6 @@ def make_mesh():
     mesh = jax.make_mesh((4, 1), ("data", "expert"))
     return mesh
 
-def count_params(model: DiffusionLLM):
-    """Count the total number of parameters in the model."""
-    return sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model)))
-
 @nnx.jit
 def create_sharded_model():
     model = DiffusionLLM(**MODEL_CONFIG, rngs=nnx.Rngs(0))
@@ -176,6 +172,16 @@ def create_learning_rate_schedule(
         boundaries=[warmup_steps]
     )
 
+
+def count_params(model: DiffusionLLM) -> float:
+    """Count total number of trainable parameters in billions."""
+    total = 0
+    state = nnx.state(model)
+    for param in jax.tree_util.tree_leaves(state):
+        if isinstance(param, jnp.ndarray):
+            total += param.size
+    return total / 1e9  # Convert to billions
+
 def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
     """Create an Orbax checkpoint manager."""
     os.makedirs(base_dir, exist_ok=True)
@@ -195,7 +201,7 @@ def save_checkpoint(
     model: DiffusionLLM, 
     optimizer: nnx.Optimizer, 
     step: int,
-    batch_loader: 'BatchLoader',
+    batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
     """Save the model, optimizer state, current step, and batch state to checkpoint."""
@@ -227,7 +233,7 @@ def load_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     model: DiffusionLLM,
     optimizer: nnx.Optimizer,
-    batch_loader: Optional['BatchLoader'] = None
+    batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
     """Load checkpoint into existing model and optimizer if available."""
     # Check if checkpoint exists
