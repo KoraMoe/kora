@@ -230,6 +230,7 @@ def save_checkpoint(
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
+    mesh: jax.sharding.Mesh,
     ckpt_manager: ocp.CheckpointManager,
     model: DiffusionLLM,
     optimizer: nnx.Optimizer,
@@ -242,15 +243,17 @@ def load_checkpoint(
         print("No checkpoint found, starting from scratch")
         return 0, {}
     
-    # Create abstract target based on the existing model and optimizer
+    # Create abstract states with sharding information
     abs_model_state = jax.tree_map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
-        nnx.state(model)
+        lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
+        nnx.state(model),
+        nnx.get_named_sharding(nnx.state(model), mesh)
     )
     
     abs_optimizer_state = jax.tree_map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
-        nnx.state(optimizer)
+        lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
+        nnx.state(optimizer),
+        nnx.get_named_sharding(nnx.state(optimizer), mesh)
     )
     
     # Create target dict for restoration
@@ -268,11 +271,9 @@ def load_checkpoint(
     
     # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
-    #restore_args = ocp.checkpoint_utils.construct_restore_args(abs_target)
     restored = ckpt_manager.restore(
         step,
         items=abs_target,
-        #restore_kwargs={'restore_args': restore_args}
     )
     
     # Update model and optimizer states
@@ -286,26 +287,19 @@ def load_checkpoint(
             batch_loader.current_epoch = batch_state["current_epoch"]
             batch_loader.current_idx = batch_state["current_idx"]
             
-            # Handle potential issues with indices
             indices = batch_state["indices"]
             if len(indices) > 0:
-                # Ensure indices are within the valid range for the dataset
                 indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
                 batch_loader.indices = indices
             else:
                 batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             
-            # Reinitialize the generator with the restored state
-            batch_loader._producer_thread()
-            
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
             print("Reinitializing batch loader...")
-            # Reset the batch loader to initial state
             batch_loader.current_epoch = 0
             batch_loader.current_idx = 0
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader._producer_thread()
     
     return restored["step"], restored.get("metrics", {})
 
@@ -551,7 +545,7 @@ def main():
         sync_global_devices("optimizer_created")
         
         # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
+        start_step, metrics = load_checkpoint(mesh, ckpt_manager, model, optimizer, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
         sync_global_devices("checkpoint_restored")
         
