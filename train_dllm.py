@@ -405,7 +405,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         router_loss=router_loss
     )
 
-def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50, rngs: nnx.Rngs = nnx.Rngs(0)):
+def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0)):
     @nnx.jit
     def encode_input(model, input_ids):
         return model.encode(input_ids)
@@ -415,34 +415,62 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
         return model.noise(x, t, rngs)
 
     @nnx.jit
-    def denoise_step(model, x_t, t, rngs, attention_mask):
-        return model.denoise(x_t, t, rngs, attention_mask)
+    def denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0):
+        # Denoise
+        new_x = model.denoise(x_t, t, rngs, attention_mask)
+        # Keep prompt tokens unchanged
+        return jnp.where(prompt_mask[..., None], x_0, new_x)
 
     @nnx.jit
     def decode_output(model, x_t):
         logits = model.decode(x_t)
         return jnp.argmax(logits, axis=-1)
+
     # Tokenize prompt
-    input_tokens = tokenizer(prompt, return_tensors="np")
+    input_tokens = tokenizer(prompt, return_tensors="np", padding=False, truncation=True)
     input_ids = jnp.array(input_tokens["input_ids"])
+    prompt_len = input_ids.shape[1]
+    
+    # Pad or truncate to fixed sequence length
+    padded_input_ids = jnp.zeros((1, seq_len), dtype=jnp.int32)
+    padded_input_ids = padded_input_ids.at[:, :prompt_len].set(input_ids)
+    
+    # Create prompt mask (1 for prompt tokens, 0 for noise tokens)
+    prompt_mask = jnp.zeros((1, seq_len), dtype=jnp.bool_)
+    prompt_mask = prompt_mask.at[:, :prompt_len].set(True)
     
     # Pad the batch dimension to match data parallel size (4)
-    input_ids = jnp.tile(input_ids, (4, 1))  # Repeat the same input 4 times
-    attention_mask = jnp.ones_like(input_ids)
+    input_ids = jnp.tile(padded_input_ids, (4, 1))
+    prompt_mask = jnp.tile(prompt_mask, (4, 1))
+    attention_mask = jnp.ones_like(input_ids)  # All ones for full attention
     
-    # Initialize with encoded prompt (jitted)
-    x = encode_input(model, input_ids)
+    # Encode prompt
+    x_0 = encode_input(model, input_ids)
     
-    # Add noise gradually and then denoise (jitted)
-    t = jnp.full(input_ids.shape, model.timesteps - 1, dtype=jnp.int32)
-    x_t, _ = add_noise(model, x, t, rngs)
+    # Initialize timesteps - 0 for prompt, max timestep for noise tokens
+    t = jnp.where(
+        prompt_mask,
+        jnp.zeros_like(input_ids),
+        jnp.full_like(input_ids, model.timesteps - 1)
+    )
     
-    # Denoise step by step (jitted)
+    # Add noise only to non-prompt positions
+    x_t, _ = add_noise(model, x_0, t, rngs)
+    
+    # Only use noise for non-prompt positions
+    x_t = jnp.where(prompt_mask[..., None], x_0, x_t)
+    
+    # Denoise step by step
     for timestep in range(model.timesteps - 1, -1, -1):
-        t = jnp.full(input_ids.shape, timestep, dtype=jnp.int32)
-        x_t = denoise_step(model, x_t, t, rngs, attention_mask)
+        # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
+        t = jnp.where(
+            prompt_mask,
+            jnp.zeros_like(input_ids),
+            jnp.full_like(input_ids, timestep)
+        )
+        x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
     
-    # Decode to tokens (jitted)
+    # Decode to tokens
     generated_ids = decode_output(model, x_t)
     
     # Only take the first sequence since we tiled the input
