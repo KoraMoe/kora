@@ -439,8 +439,6 @@ def main():
     train_dataset, test_dataset = load_dataset()
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
-    jax.distributed.initialize()
-
     if jax.process_index() == 0:
         wandb.init(
             project="kora-diffusion",
