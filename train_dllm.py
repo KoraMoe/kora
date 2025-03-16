@@ -332,7 +332,7 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         # Only compute loss for non-zero timesteps and valid tokens
         noise_loss = jnp.sum(
             loss_mask * ((predicted_noise - noise) ** 2)
-        ) / (jnp.sum(loss_mask) + 1e-8)  # Add small epsilon to avoid division by zero
+        ) / (jnp.sum(loss_mask) + 1e-8) / jnp.sqrt(seq_len)
 
         total_loss = noise_loss + jnp.mean(router_loss)
         
