@@ -409,6 +409,8 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     @nnx.jit
     def denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0):
         # Denoise
+        # Add extra dimension to attention_mask to match expected shape
+        attention_mask = attention_mask[..., None]  # Shape becomes (batch, seq_len, 1)
         new_x = model.denoise(x_t, t, rngs, attention_mask)
         # Keep prompt tokens unchanged
         return jnp.where(prompt_mask[..., None], x_0, new_x)
