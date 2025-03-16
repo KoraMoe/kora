@@ -410,6 +410,9 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     # Tokenize prompt
     input_tokens = tokenizer(prompt, return_tensors="np")
     input_ids = jnp.array(input_tokens["input_ids"])
+    
+    # Pad the batch dimension to match data parallel size (4)
+    input_ids = jnp.tile(input_ids, (4, 1))  # Repeat the same input 4 times
     attention_mask = jnp.ones_like(input_ids)
     
     # Initialize with encoded prompt
@@ -428,7 +431,7 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     logits = model.decode(x_t)
     generated_ids = jnp.argmax(logits, axis=-1)
     
-    # Decode to text
+    # Only take the first sequence since we tiled the input
     generated_text = tokenizer.decode(generated_ids[0])
     return generated_text
 
