@@ -6,22 +6,23 @@ from functools import partial
 @partial(nnx.vmap, in_axes=(0, None, 0, None))
 @partial(nnx.vmap, in_axes=(0, None, None, None))
 def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
+    # Start with base mask from attention mask if provided
+    if attn_mask is not None:
+        # Convert attention mask to float and expand dims for broadcasting
+        mask = attn_mask[None, :].astype(score_matrix.dtype)
+    else:
+        mask = jnp.ones((seq_len, seq_len), dtype=score_matrix.dtype)
+    
+    # Optionally apply causal mask
     if is_causal:
         row_idx = jnp.arange(seq_len)[None, :]
         col_idx = jnp.arange(seq_len)[:, None]
         causal_mask = row_idx <= col_idx
-    else:
-        causal_mask = jnp.ones((seq_len, seq_len), dtype=bool)
+        # Multiply with causal mask (0 or 1) to preserve scaling from attention mask
+        mask = mask * causal_mask.astype(mask.dtype)
     
-    if attn_mask is not None:
-        mask = jnp.logical_and(
-            causal_mask,
-            jnp.logical_or(attn_mask[:, None] > 0, jnp.eye(seq_len, dtype=bool))
-        )
-    else:
-        mask = causal_mask
-    
-    return jnp.where(mask, score_matrix, -1e9)
+    # Apply scaled masking: mask=1 keeps original value, mask=0 sets to -inf, intermediate values scale logits
+    return jnp.where(mask > 0, score_matrix + jnp.log(mask), -1e9)
 
 def orthogonal_init(scale=1.0):
     """Create an orthogonal initializer with the given scale."""
@@ -567,7 +568,7 @@ class MixtureLayer(nnx.Module):
                 jnp.einsum('gsec,gsd->gesd', ff_dispatch, x_grouped),
                 jax.sharding.PartitionSpec('data', 'expert', None, None)
             )
-
+            
             # 2. Process with experts (already sharded on expert dimension)
             expert_outputs = self.feedforward_experts(dispatch_to_expert)  # [experts, groups, size, d_model]
             
@@ -849,6 +850,9 @@ class DiffusionLLM(nnx.Module):
         capacity_factor: float = 2.0,
         min_expert_capacity: int = 8,
         max_group_size: int = 4096,
+        timesteps: int = 1000,
+        beta_start: float = 0.0001,
+        beta_end: float = 0.02,
         router_z_loss_coef: float = 1e-3,
         router_balance_loss_coef: float = 1e-4,
         dtype: jnp.dtype = jnp.bfloat16,
@@ -870,12 +874,16 @@ class DiffusionLLM(nnx.Module):
         self.capacity_factor = capacity_factor
         self.min_expert_capacity = min_expert_capacity
         self.max_group_size = max_group_size
+        self.timesteps = timesteps
+        self.beta_start = beta_start
+        self.beta_end = beta_end
         self.router_z_loss_coef = router_z_loss_coef
         self.router_balance_loss_coef = router_balance_loss_coef
         self.dtype = dtype
         self.training = training
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.need_attention_mask = need_attention_mask
+        
 
         if init_fn is None:
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
@@ -914,6 +922,13 @@ class DiffusionLLM(nnx.Module):
         ]
         
         self.final_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+
+        # Build noise schedule
+        self.betas = nnx.Variable(jnp.linspace(beta_start, beta_end, timesteps))
+        self.alphas = nnx.Variable(1.0 - self.betas)
+        self.alphas_cumprod = nnx.Variable(jnp.cumprod(self.alphas.value))
+        self.sqrt_alphas_cumprod = nnx.Variable(jnp.sqrt(self.alphas_cumprod.value))
+        self.sqrt_one_minus_alphas_cumprod = nnx.Variable(jnp.sqrt(1.0 - self.alphas_cumprod.value))
     
     def encode(self, input_ids: jnp.ndarray) -> jnp.ndarray:
         return self.text_head[input_ids]
@@ -921,19 +936,73 @@ class DiffusionLLM(nnx.Module):
     def decode(self, x: jnp.ndarray) -> jnp.ndarray:
         return jnp.einsum('btd,vd->btv', x, self.text_head)
 
-    def __call__(self, x: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def noise(self, x_0: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # x_0 shape: (batch_size, seq_len, d_model)
+        # t shape: (batch_size, seq_len)
+        
+        noise = jax.random.normal(rngs.params(), shape=x_0.shape, dtype=self.dtype)
+        
+        # Reshape t to match the dimensions we're working with
+        # Add a dimension for d_model
+        t = t[..., None]  # shape: (batch_size, seq_len, 1)
+        
+        sqrt_alphas_cumprod_t = jnp.take(self.sqrt_alphas_cumprod.value, t)
+        sqrt_one_minus_alphas_cumprod_t = jnp.take(self.sqrt_one_minus_alphas_cumprod.value, t)
+        
+        # The broadcasting will now work correctly for token-wise timesteps
+        x_t = sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
+        
+        return x_t, noise
+
+    def denoise(self, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+        # x_t shape: (batch_size, seq_len, d_model)
+        # t shape: (batch_size, seq_len)
+        
+        # Reshape t for broadcasting
+        t = t[..., None]  # shape: (batch_size, seq_len, 1)
+        
+        # Get parameters for each token's timestep
+        alpha_t = jnp.take(self.alphas.value, t)
+        alpha_cumprod_t = jnp.take(self.alphas_cumprod.value, t)
+        beta_t = jnp.take(self.betas.value, t)
+        
+        predicted_noise, _ = self.__call__(x_t, t, attn_mask)
+        
+        rng_key = rngs.params()
+        
+        # Create noise for each token position
+        noise = jax.random.normal(rng_key, shape=x_t.shape, dtype=self.dtype)
+        
+        # Create a mask for t > 0 with proper broadcasting
+        t_mask = (t > 0).astype(self.dtype)
+        noise = noise * t_mask
+        
+        x_t_minus_1 = (1 / jnp.sqrt(alpha_t)) * (
+            x_t - ((1 - alpha_t) / jnp.sqrt(1 - alpha_cumprod_t)) * predicted_noise
+        ) + jnp.sqrt(beta_t) * noise
+        
+        return x_t_minus_1
+
+    def __call__(self, x: jnp.ndarray, t: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
+        # Calculate dynamic attention mask based on timesteps
+        # t shape: (batch, seq_len)
+        # attn_mask shape: (batch, seq_len) - 1 for real tokens, 0 for padding
+        
+        # Linear interpolation from 1 to 0 based on timestep
+        t_ratio = t.astype(self.dtype) / self.timesteps
+        dynamic_mask = (1.0 - t_ratio) * (attn_mask if attn_mask is not None else 1.0)
+        
         router_loss = jnp.zeros((), dtype=self.dtype)
         for i, block in enumerate(self.blocks):
             if not self.training:
-                x, _ = block(x, attn_mask)
+                x, _ = block(x, dynamic_mask)
             else:
-                x, block_loss = block(x, attn_mask)
+                x, block_loss = block(x, dynamic_mask)
                 router_loss += block_loss
         
         x = self.final_norm(x)
         router_loss /= self.num_layers
         return x, router_loss
-    
 
 class Test():
     def __init__(self):
@@ -1011,8 +1080,12 @@ class Test():
     
     @staticmethod
     @nnx.jit
-    def test_diffusion_llm(module, input_ids):
-        return module(input_ids)
+    def test_diffusion_llm(module: DiffusionLLM, input_ids, rngs: nnx.Rngs, attention_mask: jnp.ndarray):
+        x = module.encode(input_ids)
+        x, noise = module.noise(x, jnp.array([100]), rngs)
+        x = module.denoise(x, jnp.array([99]), rngs, attn_mask=attention_mask)
+        logits = module.decode(x)
+        return logits
 
     def __call__(self):
         with self.mesh:
@@ -1083,9 +1156,16 @@ class Test():
             
             # Test Diffusion LLM
             input_ids = jnp.ones((self.batch_size, self.seq_len), dtype=jnp.int32)
+            attention_mask = jax.random.uniform(
+                jax.random.key(0), 
+                shape=(self.batch_size, self.seq_len),
+                minval=0.0,
+                maxval=1.0
+            )
             try:
-                logits, avg_loss = self.test_diffusion_llm(self.diffusion_llm, input_ids)
-                print("Diffusion LLM output shape and avg loss:", logits.shape, avg_loss)
+                rngs = nnx.Rngs(params=jax.random.key(0))
+                logits = self.test_diffusion_llm(self.diffusion_llm, input_ids, rngs, attention_mask=attention_mask)
+                print("Diffusion LLM output shape:", logits.shape)
                 results['Diffusion LLM'] = 'SUCCESS'
             except Exception as e:
                 print("Diffusion LLM error:", e)
