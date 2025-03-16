@@ -137,17 +137,8 @@ def load_dataset():
     return train_dataset, test_dataset
 
 def make_mesh():
-    """Create a device mesh for distributed training."""
-    devices = jax.devices()
-    num_devices = len(devices)
-    
-    # Adjust mesh shape based on available devices
-    data_parallel = MESH_SHAPE[0]
-    model_parallel = num_devices // data_parallel
-    mesh_shape = (data_parallel, model_parallel)
-    
-    device_mesh = np.array(devices).reshape(mesh_shape)
-    return jax.sharding.Mesh(device_mesh, ('data', 'model'))
+    mesh = jax.make_mesh((4, 1), ("data", "expert"))
+    return mesh
 
 def count_params(model: DiffusionLLM):
     """Count the total number of parameters in the model."""
