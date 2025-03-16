@@ -406,7 +406,22 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
     )
 
 def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", max_new_tokens: int = 50, rngs: nnx.Rngs = nnx.Rngs(0)):
-    """Generate text using the diffusion model."""
+    @nnx.jit
+    def encode_input(model, input_ids):
+        return model.encode(input_ids)
+
+    @nnx.jit
+    def add_noise(model, x, t, rngs):
+        return model.noise(x, t, rngs)
+
+    @nnx.jit
+    def denoise_step(model, x_t, t, rngs, attention_mask):
+        return model.denoise(x_t, t, rngs, attention_mask)
+
+    @nnx.jit
+    def decode_output(model, x_t):
+        logits = model.decode(x_t)
+        return jnp.argmax(logits, axis=-1)
     # Tokenize prompt
     input_tokens = tokenizer(prompt, return_tensors="np")
     input_ids = jnp.array(input_tokens["input_ids"])
@@ -415,21 +430,20 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     input_ids = jnp.tile(input_ids, (4, 1))  # Repeat the same input 4 times
     attention_mask = jnp.ones_like(input_ids)
     
-    # Initialize with encoded prompt
-    x = model.encode(input_ids)
+    # Initialize with encoded prompt (jitted)
+    x = encode_input(model, input_ids)
     
-    # Add noise gradually and then denoise
+    # Add noise gradually and then denoise (jitted)
     t = jnp.full(input_ids.shape, model.timesteps - 1, dtype=jnp.int32)
-    x_t, _ = model.noise(x, t, rngs)
+    x_t, _ = add_noise(model, x, t, rngs)
     
-    # Denoise step by step
+    # Denoise step by step (jitted)
     for timestep in range(model.timesteps - 1, -1, -1):
         t = jnp.full(input_ids.shape, timestep, dtype=jnp.int32)
-        x_t = model.denoise(x_t, t, rngs, attention_mask)
+        x_t = denoise_step(model, x_t, t, rngs, attention_mask)
     
-    # Decode to logits and get tokens
-    logits = model.decode(x_t)
-    generated_ids = jnp.argmax(logits, axis=-1)
+    # Decode to tokens (jitted)
+    generated_ids = decode_output(model, x_t)
     
     # Only take the first sequence since we tiled the input
     generated_text = tokenizer.decode(generated_ids[0])
