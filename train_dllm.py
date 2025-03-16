@@ -119,9 +119,22 @@ class BatchLoader:
             self._thread.join(timeout=1.0)
 
 def load_dataset():
-    """Load the tokenized dataset from disk."""
+    # Load the tokenized dataset
     dataset = load_from_disk(TOKENIZED_DATASET_PATH)
-    return dataset
+
+    # Use indices to create test set
+    dataset_size = len(dataset)  # type: ignore
+    test_size = BATCH_SIZE
+    
+    all_indices = list(range(dataset_size))
+    test_indices = all_indices[-test_size:]
+    train_indices = all_indices[:-test_size]
+    
+    # Split using the indices
+    train_dataset = dataset.select(train_indices)  # type: ignore
+    test_dataset = dataset.select(test_indices)  # type: ignore
+    
+    return train_dataset, test_dataset
 
 def make_mesh():
     """Create a device mesh for distributed training."""
