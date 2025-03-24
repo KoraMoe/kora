@@ -410,7 +410,7 @@ def load_checkpoint(
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
         step,
-        args=ocp.args.StandardRestore(abs_target)
+        restore_kwargs={'target': abs_target}
     )
     
     # Update model and optimizer states
