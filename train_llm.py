@@ -383,12 +383,12 @@ def load_checkpoint(
         return 0, {}
     
     # Create abstract target based on the existing model and optimizer
-    abs_model_state = jax.tree_map(
+    abs_model_state = jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
         nnx.state(model)
     )
     
-    abs_optimizer_state = jax.tree_map(
+    abs_optimizer_state = jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
         nnx.state(optimizer)
     )
@@ -409,7 +409,8 @@ def load_checkpoint(
     # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
-        step
+        step,
+        restore_kwargs={'target': abs_target}
     )
     
     # Update model and optimizer states
