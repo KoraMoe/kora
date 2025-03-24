@@ -13,8 +13,8 @@ TOKENIZED_DATASET_PATH = "/mnt/data/tokenized_dataset"
 TOKENIZER_NAME = "gpt2"
 CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
 LOG_STEPS = 50
-EVAL_STEPS = 500
-SAMPLE_STEPS = 500
+EVAL_STEPS = 5000
+SAMPLE_STEPS = 5000
 MESH_SHAPE = (16, 1)  # (data, expert)
 
 VOCAB_SIZE = 50257
