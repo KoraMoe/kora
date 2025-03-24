@@ -492,7 +492,6 @@ def main():
         # Create model
         model = create_sharded_model()
         print(f"Process {jax.process_index()}: Created sharded model")
-        sync_global_devices("model_created")
         
         # Print model size
         print(f"\nModel Parameters: {count_params(model):.2f}B")
@@ -524,7 +523,6 @@ def main():
         # Try to restore from checkpoint
         start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
-        sync_global_devices("checkpoint_restored")
         
         # Initialize best eval loss from checkpoint metrics or default
         best_eval_loss = metrics.get("best_eval_loss", float('inf'))
