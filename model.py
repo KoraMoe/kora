@@ -966,7 +966,8 @@ class DiffusionLLM(nnx.Module):
         alpha_cumprod_t = jnp.take(self.alphas_cumprod.value, t)
         beta_t = jnp.take(self.betas.value, t)
         
-        predicted_noise, _ = self.__call__(x_t, t, attn_mask)
+        # Now __call__ predicts x_0 directly instead of noise
+        predicted_x_0, _ = self.__call__(x_t, t, attn_mask)
         
         rng_key = rngs.params()
         
@@ -977,9 +978,17 @@ class DiffusionLLM(nnx.Module):
         t_mask = (t > 0).astype(self.dtype)
         noise = noise * t_mask
         
-        x_t_minus_1 = (1 / jnp.sqrt(alpha_t)) * (
-            x_t - ((1 - alpha_t) / jnp.sqrt(1 - alpha_cumprod_t)) * predicted_noise
-        ) + jnp.sqrt(beta_t) * noise
+        # Compute posterior mean using predicted x_0
+        posterior_mean = (
+            jnp.sqrt(alpha_cumprod_t) * beta_t / (1.0 - alpha_cumprod_t) * predicted_x_0 +
+            jnp.sqrt(alpha_t) * (1.0 - alpha_cumprod_t / alpha_t) / (1.0 - alpha_cumprod_t) * x_t
+        )
+        
+        # Compute posterior variance
+        posterior_variance = beta_t * (1.0 - alpha_cumprod_t / alpha_t) / (1.0 - alpha_cumprod_t)
+        
+        # Sample from posterior
+        x_t_minus_1 = posterior_mean + jnp.sqrt(posterior_variance) * noise
         
         return x_t_minus_1
 

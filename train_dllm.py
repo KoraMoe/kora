@@ -322,24 +322,36 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         )
 
         x_0 = model.encode(input_ids)
-        x_t, noise = model.noise(x_0, t, rngs)
+        x_t, _ = model.noise(x_0, t, rngs)
 
-        predicted_noise, router_loss = model(x_t, t, attn_mask=attention_mask)
+        # Model now predicts x_0 directly
+        predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
+        
+        # Decode predicted x_0 to get logits over vocabulary
+        logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
 
         # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
-        loss_mask = (t > 0).astype(predicted_noise.dtype)[..., None] * attention_mask[..., None]
+        loss_mask = (t > 0).astype(jnp.float32) * attention_mask
         
-        # Only compute loss for non-zero timesteps and valid tokens
-        noise_loss = jnp.sum(
-            loss_mask * ((predicted_noise - noise) ** 2)
-        ) / (jnp.sum(loss_mask) + 1e-8) / jnp.sqrt(seq_len)
+        # Compute cross entropy loss
+        # Using standard cross entropy with optional label smoothing
+        labels = nnx.one_hot(input_ids, num_classes=logits.shape[-1])
+        per_token_loss = -jnp.sum(
+            labels * nnx.log_softmax(logits),
+            axis=-1
+        )
+        
+        # Apply loss mask and compute mean loss
+        masked_loss = jnp.sum(
+            loss_mask * per_token_loss
+        ) / (jnp.sum(loss_mask) + 1e-8)
 
-        total_loss = noise_loss + jnp.mean(router_loss)
+        total_loss = masked_loss + jnp.mean(router_loss)
         
-        return total_loss, (noise_loss, router_loss)
+        return total_loss, (masked_loss, router_loss)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (noise_loss, router_loss)), grads = grad_fn(model)
+    (total_loss, (x0_loss, router_loss)), grads = grad_fn(model)
     
     # Update model parameters
     optimizer.update(grads)
@@ -347,7 +359,7 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
     # Update metrics
     metrics.update(
         total_loss=total_loss,
-        noise_loss=noise_loss,
+        x0_loss=x0_loss,
         router_loss=router_loss
     )
 
@@ -557,7 +569,7 @@ def main():
         # Create metrics tracker
         train_metrics = nnx.MultiMetric(
             total_loss=nnx.metrics.Average('total_loss'),
-            noise_loss=nnx.metrics.Average('noise_loss'),
+            x0_loss=nnx.metrics.Average('x0_loss'),
             router_loss=nnx.metrics.Average('router_loss')
         )
         
@@ -592,7 +604,7 @@ def main():
                 
                 progress_bar.set_postfix({
                     'loss': f"{metrics_values['total_loss']:.4f}",
-                    'noise_loss': f"{metrics_values['noise_loss']:.4f}",
+                    'x0_loss': f"{metrics_values['x0_loss']:.4f}",
                     'lr': f"{lr_schedule(step):.6f}"
                 })
 
