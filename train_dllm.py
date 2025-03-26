@@ -183,16 +183,16 @@ def count_params(model: DiffusionLLM) -> float:
     return total / 1e9  # Convert to billions
 
 def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
-    """Create an Orbax checkpoint manager."""
+    """Create an Orbax checkpoint manager with the new API style."""
     os.makedirs(base_dir, exist_ok=True)
-    checkpointer = ocp.StandardCheckpointer()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
+        enable_async_checkpointing=True,
     )
+    # Use the new API style without additional parameters
     return ocp.CheckpointManager(
         base_dir,
-        checkpointer,
         options=options,
     )
 
@@ -204,7 +204,7 @@ def save_checkpoint(
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
-    """Save the model, optimizer state, current step, and batch state to checkpoint."""
+    """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
     # Get states to save
     model_state = nnx.state(model)
     optimizer_state = nnx.state(optimizer)
@@ -216,64 +216,52 @@ def save_checkpoint(
         "indices": np.array(batch_loader.indices),  # Convert to numpy for serialization
     }
     
-    # Combine everything into one state dict
-    ckpt_state = {
-        "model": model_state,
-        "optimizer": optimizer_state,
-        "step": step,
-        "batch_state": batch_state,
-        "metrics": metrics or {},
-    }
-    
-    # Save the checkpoint
-    ckpt_manager.save(step, ckpt_state)
+    ckpt_manager.save(
+        step, 
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(model_state),
+            optimizer=ocp.args.StandardSave(optimizer_state),
+            batch_state=ocp.args.StandardSave(batch_state),
+            model_stats=ocp.args.StandardSave(metrics or {})
+        )
+    )
+    ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
-    mesh: jax.sharding.Mesh,
     ckpt_manager: ocp.CheckpointManager,
     model: DiffusionLLM,
     optimizer: nnx.Optimizer,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
-    """Load checkpoint into existing model and optimizer if available."""
+    """Load checkpoint into existing model and optimizer if available using new API."""
     # Check if checkpoint exists
     step = ckpt_manager.latest_step()
     if step is None:
         print("No checkpoint found, starting from scratch")
         return 0, {}
     
-    # Create abstract states with sharding information
-    abs_model_state = jax.tree_map(
-        lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
-        nnx.state(model),
-        nnx.get_named_sharding(nnx.state(model), mesh)
+    # Create abstract target based on the existing model and optimizer
+    abs_model_state = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
+        nnx.state(model)
     )
     
-    abs_optimizer_state = jax.tree_map(
-        lambda a, s: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=s),
-        nnx.state(optimizer),
-        nnx.get_named_sharding(nnx.state(optimizer), mesh)
+    abs_optimizer_state = jax.tree.map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
+        nnx.state(optimizer)
     )
-    
-    # Create target dict for restoration
-    abs_target = {
-        "model": abs_model_state,
-        "optimizer": abs_optimizer_state,
-        "step": 0,
-        "batch_state": {
-            "current_epoch": 0,
-            "current_idx": 0, 
-            "indices": np.array([]),
-        },
-        "metrics": {},
-    }
-    
+
     # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
-        step,
-        items=abs_target,
+        step, 
+        args=ocp.args.Composite(
+            model=ocp.args.StandardRestore(abs_model_state),
+            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
+            batch_state=ocp.args.StandardRestore(),
+            model_stats=ocp.args.StandardRestore()
+        )
     )
     
     # Update model and optimizer states
@@ -287,21 +275,28 @@ def load_checkpoint(
             batch_loader.current_epoch = batch_state["current_epoch"]
             batch_loader.current_idx = batch_state["current_idx"]
             
+            # Handle potential issues with indices
             indices = batch_state["indices"]
             if len(indices) > 0:
+                # Ensure indices are within the valid range for the dataset
                 indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
                 batch_loader.indices = indices
             else:
                 batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             
+            # Reinitialize the generator with the restored state
+            batch_loader._producer_thread()
+            
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
             print("Reinitializing batch loader...")
+            # Reset the batch loader to initial state
             batch_loader.current_epoch = 0
             batch_loader.current_idx = 0
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+            batch_loader._producer_thread()
     
-    return restored["step"], restored.get("metrics", {})
+    return step, restored.get("model_stats", {})
 
 @nnx.jit
 def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, rngs: nnx.Rngs, batch):
@@ -557,7 +552,7 @@ def main():
         sync_global_devices("optimizer_created")
         
         # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(mesh, ckpt_manager, model, optimizer, train_loader)
+        start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
         sync_global_devices("checkpoint_restored")
         
