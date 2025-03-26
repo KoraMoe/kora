@@ -356,21 +356,15 @@ def save_checkpoint(
         "indices": np.array(batch_loader.indices),  # Convert to numpy for serialization
     }
     
-    # Combine everything into one state dict
-    ckpt_state = {
-        "model": model_state,
-        "optimizer": optimizer_state,
-        "step": step,
-        "batch_state": batch_state,
-        "metrics": metrics or {},
-    }
-    
-    # Save the checkpoint using the new API
     ckpt_manager.save(
         step, 
-        args=ocp.args.StandardSave(ckpt_state)
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(model_state),
+            optimizer=ocp.args.StandardSave(optimizer_state),
+            batch_state=ocp.args.StandardSave(batch_state),
+            model_stats=ocp.args.StandardSave(metrics or {})
+        )
     )
-    # Wait for save to complete since we're using async checkpointing
     ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
 
@@ -397,25 +391,17 @@ def load_checkpoint(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
         nnx.state(optimizer)
     )
-    
-    # Create target dict for restoration
-    abs_target = {
-        "model": abs_model_state,
-        "optimizer": abs_optimizer_state,
-        "step": 0,
-        "batch_state": {
-            "current_epoch": 0,
-            "current_idx": 0, 
-            "indices": np.array([]),
-        },
-        "metrics": {},
-    }
-    
-    # Restore checkpoint using the new API
+
+    # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
         step, 
-        args=ocp.args.StandardRestore(abs_target)
+        args=ocp.args.Composite(
+            model=ocp.args.StandardRestore(abs_model_state),
+            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
+            batch_state=ocp.args.StandardRestore(),
+            model_stats=ocp.args.StandardRestore()
+        )
     )
     
     # Update model and optimizer states
@@ -450,7 +436,7 @@ def load_checkpoint(
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             batch_loader._producer_thread()
     
-    return restored["step"], restored.get("metrics", {})
+    return step, restored.get("model_stats", {})
 
 def main():
     train_dataset, test_dataset = load_dataset()
