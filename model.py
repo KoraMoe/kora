@@ -53,32 +53,43 @@ def orthogonal_init(scale=1.0):
         return q.astype(dtype)
     return init
 
-class RMSNorm(nnx.Module):
+class DyT(nnx.Module):
     def __init__(self, 
         dim: int,
-        epsilon: float = 1e-6,
+        init_alpha: float = 1.0,
         dtype: jnp.dtype = jnp.bfloat16,
         rngs: nnx.Rngs = nnx.Rngs()
     ):
         self.dim = dim
-        self.epsilon = epsilon
         self.dtype = dtype
         
         key = rngs.params()
-
-        self.scale = nnx.Param(
-            jax.random.normal(key, (dim,)),
+        
+        # Initialize alpha as a learnable scalar
+        self.alpha = nnx.Param(
+            jnp.ones((1,), dtype=dtype) * init_alpha,
+            sharding=(None,),
+            dtype=self.dtype,
+        )
+        
+        # Initialize gamma (scale) and beta (bias) parameters
+        self.gamma = nnx.Param(
+            jnp.ones((dim,), dtype=dtype),
+            sharding=(None,),
+            dtype=self.dtype,
+        )
+        self.beta = nnx.Param(
+            jnp.zeros((dim,), dtype=dtype),
             sharding=(None,),
             dtype=self.dtype,
         )
     
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        # Calculate RMS along last dimension
-        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
-        x_norm = x * jax.lax.rsqrt(variance + self.epsilon)
+        # Apply dynamic tanh normalization
+        x = jnp.tanh(self.alpha.value * x)
         
-        # Scale and return
-        return self.scale * x_norm
+        # Apply affine transformation
+        return self.gamma.value * x + self.beta.value
 
 class RotaryEmbedding(nnx.Module):
     def __init__(self, 
@@ -659,8 +670,8 @@ class Block(nnx.Module):
             init_fn = nnx.initializers.normal(stddev=0.02, dtype=self.dtype)
         
         # Pre-normalization layers (norm before attention and MoE)
-        self.attn_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
-        self.moe_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        self.attn_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
+        self.moe_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
         
         # Multi-head attention
         self.attention = MultiHeadAttention(
@@ -800,7 +811,7 @@ class LLM(nnx.Module):
         ]
         
         # Final layer normalization
-        self.final_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        self.final_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
         
         # Output projection
         self.lm_head = nnx.Param(
@@ -921,7 +932,7 @@ class DiffusionLLM(nnx.Module):
             ) for layer_idx in range(self.num_layers)
         ]
         
-        self.final_norm = RMSNorm(self.d_model, epsilon=1e-6, dtype=self.dtype, rngs=rngs)
+        self.final_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
 
         # Build noise schedule
         self.betas = nnx.Variable(jnp.linspace(beta_start, beta_end, timesteps))
