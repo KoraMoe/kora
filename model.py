@@ -6,23 +6,32 @@ from functools import partial
 @partial(nnx.vmap, in_axes=(0, None, 0, None))
 @partial(nnx.vmap, in_axes=(0, None, None, None))
 def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
-    # Start with base mask from attention mask if provided
-    if attn_mask is not None:
-        # Convert attention mask to float and expand dims for broadcasting
-        mask = attn_mask[None, :].astype(score_matrix.dtype)
-    else:
-        mask = jnp.ones((seq_len, seq_len), dtype=score_matrix.dtype)
-    
-    # Optionally apply causal mask
+    # Pre-compute causal mask using a more efficient tril operation
     if is_causal:
-        row_idx = jnp.arange(seq_len)[None, :]
-        col_idx = jnp.arange(seq_len)[:, None]
-        causal_mask = row_idx <= col_idx
-        # Multiply with causal mask (0 or 1) to preserve scaling from attention mask
-        mask = mask * causal_mask.astype(mask.dtype)
+        # Use tri instead of explicit indices comparison - more efficient for TPU/GPU
+        causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=score_matrix.dtype))
+    else:
+        causal_mask = 1.0
+
+    # Fuse mask creation and application
+    if attn_mask is not None:
+        # Combine attention mask and causal mask in one operation
+        # Expand attn_mask dims and convert type in single operation
+        combined_mask = jnp.where(
+            attn_mask[None, :].astype(score_matrix.dtype) * causal_mask > 0,
+            0.0,
+            -1e9
+        )
+    else:
+        # If no attention mask, just use causal mask
+        combined_mask = jnp.where(
+            causal_mask > 0,
+            0.0,
+            -1e9
+        )
     
-    # Apply scaled masking: mask=1 keeps original value, mask=0 sets to -inf, intermediate values scale logits
-    return jnp.where(mask > 0, score_matrix + jnp.log(mask), -1e9)
+    # Single addition operation instead of log + add
+    return score_matrix + combined_mask
 
 def orthogonal_init(scale=1.0):
     """Create an orthogonal initializer with the given scale."""
@@ -1102,9 +1111,9 @@ class Test():
     @nnx.jit
     def test_diffusion_llm(module: DiffusionLLM, input_ids, rngs: nnx.Rngs, attention_mask: jnp.ndarray):
         x = module.encode(input_ids)
-        x, noise = module.noise(x, jnp.array([100]), rngs)
-        x = module.denoise(x, jnp.array([99]), rngs, attn_mask=attention_mask)
-        logits = module.decode(x)
+        x_t, noise = module.noise(x, jnp.array([100]), rngs)
+        x_t_prev = module.denoise(x_t, jnp.array([99]), rngs, attn_mask=attention_mask)
+        logits = module.decode(x_t_prev)
         return logits
 
     def __call__(self):
@@ -1186,6 +1195,7 @@ class Test():
                 rngs = nnx.Rngs(params=jax.random.key(0))
                 logits = self.test_diffusion_llm(self.diffusion_llm, input_ids, rngs, attention_mask=attention_mask)
                 print("Diffusion LLM output shape:", logits.shape)
+                print(logits)
                 results['Diffusion LLM'] = 'SUCCESS'
             except Exception as e:
                 print("Diffusion LLM error:", e)
