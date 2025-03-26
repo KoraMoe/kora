@@ -129,8 +129,6 @@ def train_step(model: LLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, b
         accuracy=jnp.mean(accuracy)
     )
 
-    return total_loss
-
 @nnx.jit
 def eval_step(model: LLM, metrics: nnx.MultiMetric, batch):
 
@@ -160,6 +158,7 @@ def eval_step(model: LLM, metrics: nnx.MultiMetric, batch):
     )
 
 def make_mesh():
+    print("TOTAL DEVICES:", jax.device_count())
     mesh = jax.make_mesh(MESH_SHAPE, ("data", "expert"))
     return mesh
 
@@ -538,15 +537,11 @@ def main():
             accuracy=nnx.metrics.Average('accuracy')
         )
 
+        sync_global_devices("start_training")
         # Main training loop
         progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
         for step in range(start_step, total_steps):
             batch = train_loader.next()
-
-            if step == 20:
-                jax.profiler.start_trace("train_step", create_perfetto_trace=True)
-            elif step == 30:
-                jax.profiler.stop_trace()
             
             train_step(model, optimizer, train_metrics, batch)
             progress_bar.update(1)
