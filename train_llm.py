@@ -555,10 +555,11 @@ def main():
                 print(f"\nSampling text at step {step + 1}:")
                 generated_text = greedy_sample(model, tokenizer)
                 print(f"Generated: {generated_text}\n")
-                wandb.log({
-                    "generated_text": generated_text,
-                    "step": step
-                })
+                if jax.process_index() == 0:
+                    wandb.log({
+                        "generated_text": generated_text,
+                        "step": step
+                    })
             
             if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
                 metrics_values = train_metrics.compute()
