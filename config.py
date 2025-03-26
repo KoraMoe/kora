@@ -35,7 +35,7 @@ MODEL_CONFIG = {
     'vocab_size': VOCAB_SIZE,
     'num_experts': 8,
     'num_shared_experts': 1,
-    'top_k': 2,
+    'top_k': 1,
     'capacity_factor': 2.0,
     'min_expert_capacity': 8,
     'max_group_size': 4096,
