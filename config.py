@@ -33,7 +33,7 @@ MODEL_CONFIG = {
     'num_heads': 16,
     'head_dim': 64,
     'vocab_size': VOCAB_SIZE,
-    'num_experts': 12,
+    'num_experts': 8,
     'num_shared_experts': 1,
     'top_k': 2,
     'capacity_factor': 2.0,
