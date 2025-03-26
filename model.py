@@ -934,7 +934,7 @@ class DiffusionLLM(nnx.Module):
         return self.text_head[input_ids]
 
     def decode(self, x: jnp.ndarray) -> jnp.ndarray:
-        return jnp.einsum('btd,vd->btv', x, self.text_head)
+        return jnp.einsum('btd,vd->btv', x, self.text_head.value)
 
     def noise(self, x_0: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs) -> tuple[jnp.ndarray, jnp.ndarray]:
         # x_0 shape: (batch_size, seq_len, d_model)
