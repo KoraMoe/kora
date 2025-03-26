@@ -2,7 +2,7 @@ import jax.numpy as jnp
 import os
 
 CONTEXT_LENGTH = 512
-BATCH_SIZE = 512
+BATCH_SIZE = 256
 NUM_EPOCHS = 10
 LEARNING_RATE = 2e-4
 WARMUP_STEPS = 500
@@ -34,7 +34,7 @@ MODEL_CONFIG = {
     'head_dim': 64,
     'vocab_size': VOCAB_SIZE,
     'num_experts': 8,
-    'num_shared_experts': 2,
+    'num_shared_experts': 1,
     'top_k': 2,
     'capacity_factor': 2.0,
     'min_expert_capacity': 8,
