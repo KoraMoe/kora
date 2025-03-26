@@ -323,16 +323,16 @@ def count_params(model: LLM) -> float:
     return total / 1e9  # Convert to billions
 
 def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
-    """Create an Orbax checkpoint manager."""
+    """Create an Orbax checkpoint manager with the new API style."""
     os.makedirs(base_dir, exist_ok=True)
-    checkpointer = ocp.StandardCheckpointer()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
+        enable_async_checkpointing=True,
     )
+    # Use the new API style without additional parameters
     return ocp.CheckpointManager(
         base_dir,
-        checkpointer,
         options=options,
     )
 
@@ -344,7 +344,7 @@ def save_checkpoint(
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
-    """Save the model, optimizer state, current step, and batch state to checkpoint."""
+    """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
     # Get states to save
     model_state = nnx.state(model)
     optimizer_state = nnx.state(optimizer)
@@ -365,8 +365,13 @@ def save_checkpoint(
         "metrics": metrics or {},
     }
     
-    # Save the checkpoint
-    ckpt_manager.save(step, ckpt_state)
+    # Save the checkpoint using the new API
+    ckpt_manager.save(
+        step, 
+        args=ocp.args.StandardSave(ckpt_state)
+    )
+    # Wait for save to complete since we're using async checkpointing
+    ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
@@ -375,7 +380,7 @@ def load_checkpoint(
     optimizer: nnx.Optimizer,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
-    """Load checkpoint into existing model and optimizer if available."""
+    """Load checkpoint into existing model and optimizer if available using new API."""
     # Check if checkpoint exists
     step = ckpt_manager.latest_step()
     if step is None:
@@ -406,11 +411,11 @@ def load_checkpoint(
         "metrics": {},
     }
     
-    # Restore checkpoint
+    # Restore checkpoint using the new API
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
-        step,
-        restore_kwargs={'target': abs_target}
+        step, 
+        args=ocp.args.StandardRestore(abs_target)
     )
     
     # Update model and optimizer states
