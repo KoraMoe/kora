@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "datasets==3.3.2",
-    "flax==0.10.3",
-    "jax==0.5.0",
+    "flax==0.10.4",
+    "jax==0.5.3",
     "optax==0.2.4",
     "transformers==4.49.0",
     "libtpu==0.0.10.1; sys_platform != 'darwin'",
