@@ -397,13 +397,27 @@ def save_checkpoint(
         "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
     }
     
+    # Convert metrics to JSON-serializable format
+    if metrics:
+        serializable_metrics = {}
+        for k, v in metrics.items():
+            if isinstance(v, dict):
+                serializable_metrics[k] = {
+                    subk: float(subv) if isinstance(subv, (jnp.ndarray, np.ndarray)) else subv
+                    for subk, subv in v.items()
+                }
+            else:
+                serializable_metrics[k] = float(v) if isinstance(v, (jnp.ndarray, np.ndarray)) else v
+    else:
+        serializable_metrics = {}
+    
     ckpt_manager.save(
         step, 
         args=ocp.args.Composite(
             model=ocp.args.StandardSave(model_state),
             optimizer=ocp.args.StandardSave(optimizer_state),
             batch_state=ocp.args.JsonSave(batch_state),
-            model_stats=ocp.args.JsonSave(metrics or {}),
+            model_stats=ocp.args.JsonSave(serializable_metrics),
             extra_metadata=ocp.args.JsonSave({})
         )
     )
