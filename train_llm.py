@@ -408,7 +408,7 @@ def save_checkpoint(
     
     ckpt_manager.save(
         step, 
-        args=ocp.args.StandardSave(ckpt_state)
+        items=ckpt_state
     )
     #ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
@@ -453,7 +453,7 @@ def load_checkpoint(
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
         step,
-        args=ocp.args.StandardRestore(abs_ckpt_state)
+        items=abs_ckpt_state
     )
     
     # Update model and optimizer states
