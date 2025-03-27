@@ -384,56 +384,45 @@ def save_checkpoint(
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
+    sync_global_devices("save_checkpoint")
     """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
-    # Ensure all processes are synced before starting checkpoint save
-    sync_global_devices("save_checkpoint_start")
+    # Get states to save
+    model_state = nnx.state(model)
+    optimizer_state = nnx.state(optimizer)
     
-    # Only primary worker (process 0) should handle the actual saving
-    if jax.process_index() == 0:
-        # Get states to save
-        model_state = nnx.state(model)
-        optimizer_state = nnx.state(optimizer)
-        
-        # Create batch state dict to save batch loader state
-        batch_state = {
-            "current_epoch": batch_loader.current_epoch,
-            "current_idx": batch_loader.current_idx,
-            "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
-        }
-        
-        # Convert metrics to JSON-serializable format
-        if metrics:
-            serializable_metrics = {}
-            for k, v in metrics.items():
-                if isinstance(v, dict):
-                    serializable_metrics[k] = {
-                        subk: float(subv) if isinstance(subv, (jnp.ndarray, np.ndarray)) else subv
-                        for subk, subv in v.items()
-                    }
-                else:
-                    serializable_metrics[k] = float(v) if isinstance(v, (jnp.ndarray, np.ndarray)) else v
-        else:
-            serializable_metrics = {}
-        
-        try:
-            ckpt_manager.save(
-                step, 
-                args=ocp.args.Composite(
-                    model=ocp.args.StandardSave(model_state),
-                    optimizer=ocp.args.StandardSave(optimizer_state),
-                    batch_state=ocp.args.JsonSave(batch_state),
-                    model_stats=ocp.args.JsonSave(serializable_metrics),
-                    extra_metadata=ocp.args.JsonSave({})
-                )
-            )
-            ckpt_manager.wait_until_finished()
-            print(f"Checkpoint saved at step {step}")
-        except Exception as e:
-            print(f"Error saving checkpoint: {str(e)}")
-            raise
+    # Create batch state dict to save batch loader state
+    batch_state = {
+        "current_epoch": batch_loader.current_epoch,
+        "current_idx": batch_loader.current_idx,
+        "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
+    }
     
-    # Ensure all processes are synced after checkpoint save
-    sync_global_devices("save_checkpoint_end")
+    # Convert metrics to JSON-serializable format
+    if metrics:
+        serializable_metrics = {}
+        for k, v in metrics.items():
+            if isinstance(v, dict):
+                serializable_metrics[k] = {
+                    subk: float(subv) if isinstance(subv, (jnp.ndarray, np.ndarray)) else subv
+                    for subk, subv in v.items()
+                }
+            else:
+                serializable_metrics[k] = float(v) if isinstance(v, (jnp.ndarray, np.ndarray)) else v
+    else:
+        serializable_metrics = {}
+    
+    ckpt_manager.save(
+        step, 
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(model_state),
+            optimizer=ocp.args.StandardSave(optimizer_state),
+            batch_state=ocp.args.JsonSave(batch_state),
+            model_stats=ocp.args.JsonSave(serializable_metrics),
+            extra_metadata=ocp.args.JsonSave({})
+        )
+    )
+    ckpt_manager.wait_until_finished()
+    print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
