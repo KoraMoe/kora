@@ -80,12 +80,6 @@ class BatchLoader:
             if self._thread.is_alive():
                 print("Warning: Producer thread did not stop gracefully")
     
-    def restart(self):
-        """Safely restart the producer thread."""
-        with self._thread_lock:
-            self._stop_existing_thread()
-            self._start_producer_thread()
-    
     def _create_batch(self, indices):
         """Create a sharded batch from indices for the current process."""
         examples = {}
@@ -150,7 +144,7 @@ class BatchLoader:
         if self._stop_event.is_set():
             # Attempt to restart the thread if it died
             print("Producer thread died, attempting restart...")
-            self.restart()
+            self._start_producer_thread()
             
         try:
             # Use a timeout to prevent indefinite blocking
@@ -158,7 +152,7 @@ class BatchLoader:
             return batch
         except queue.Empty:
             print("Queue timeout, restarting producer thread...")
-            self.restart()
+            self._start_producer_thread()
             # Try one more time
             return self._queue.get(timeout=30.0)
     
@@ -333,7 +327,7 @@ def load_checkpoint(
                 batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             
             # Restart the batch loader thread with new state
-            batch_loader.restart()
+            batch_loader._start_producer_thread()
             
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
@@ -342,7 +336,7 @@ def load_checkpoint(
             batch_loader.current_epoch = 0
             batch_loader.current_idx = 0
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader.restart()
+            batch_loader._start_producer_thread()
     
     return step, restored.get("model_stats", {})
 
