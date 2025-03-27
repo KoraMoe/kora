@@ -415,8 +415,8 @@ def save_checkpoint(
     ckpt_manager.save(
         step, 
         args=ocp.args.Composite(
-            model=ocp.args.PyTreeSave(model_state),
-            optimizer=ocp.args.PyTreeSave(optimizer_state),
+            model=ocp.args.StandardSave(model_state),
+            optimizer=ocp.args.StandardSave(optimizer_state),
             batch_state=ocp.args.JsonSave(batch_state),
             model_stats=ocp.args.JsonSave(serializable_metrics),
             extra_metadata=ocp.args.JsonSave({})
@@ -454,8 +454,8 @@ def load_checkpoint(
     restored = ckpt_manager.restore(
         step, 
         args=ocp.args.Composite(
-            model=ocp.args.PyTreeRestore(abs_model_state),
-            optimizer=ocp.args.PyTreeRestore(abs_optimizer_state),
+            model=ocp.args.StandardRestore(abs_model_state),
+            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
             batch_state=ocp.args.JsonRestore(),
             model_stats=ocp.args.JsonRestore(),
             extra_metadata=ocp.args.JsonRestore()
