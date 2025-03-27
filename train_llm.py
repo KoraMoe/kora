@@ -397,30 +397,18 @@ def save_checkpoint(
         "current_idx": batch_loader.current_idx,
         "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
     }
-    
-    # Convert metrics to JSON-serializable format
-    if metrics:
-        serializable_metrics = {}
-        for k, v in metrics.items():
-            if isinstance(v, dict):
-                serializable_metrics[k] = {
-                    subk: float(subv) if isinstance(subv, (jnp.ndarray, np.ndarray)) else subv
-                    for subk, subv in v.items()
-                }
-            else:
-                serializable_metrics[k] = float(v) if isinstance(v, (jnp.ndarray, np.ndarray)) else v
-    else:
-        serializable_metrics = {}
+
+    ckpt_state = {
+        "model": model_state,
+        "optimizer": optimizer_state,
+        "batch_state": batch_state,
+        "model_stats": metrics,
+        "extra_metadata": {}
+    }
     
     ckpt_manager.save(
         step, 
-        args=ocp.args.Composite(
-            model=ocp.args.StandardSave(model_state),
-            optimizer=ocp.args.StandardSave(optimizer_state),
-            batch_state=ocp.args.JsonSave(batch_state),
-            model_stats=ocp.args.JsonSave(serializable_metrics),
-            extra_metadata=ocp.args.JsonSave({})
-        )
+        args=ocp.args.StandardSave(ckpt_state)
     )
     #ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
@@ -449,17 +437,23 @@ def load_checkpoint(
         nnx.state(optimizer)
     )
 
+    abs_ckpt_state = {
+        "model": abs_model_state,
+        "optimizer": abs_optimizer_state,
+        "batch_state": {
+            "current_epoch": 0,
+            "current_idx": 0,
+            "indices": []
+        },
+        "model_stats": {},
+        "extra_metadata": {}
+    }
+
     # Restore checkpoint
     print(f"Restoring checkpoint from step {step}")
     restored = ckpt_manager.restore(
-        step, 
-        args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(abs_model_state),
-            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
-            batch_state=ocp.args.JsonRestore(),
-            model_stats=ocp.args.JsonRestore(),
-            extra_metadata=ocp.args.JsonRestore()
-        )
+        step,
+        args=ocp.args.StandardRestore(abs_ckpt_state)
     )
     
     # Update model and optimizer states
