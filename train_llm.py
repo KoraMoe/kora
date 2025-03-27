@@ -18,7 +18,8 @@ from tqdm import tqdm
 from datasets import load_from_disk
 import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
-from jax.experimental.multihost_utils import sync_global_devices
+#from jax.experimental.multihost_utils import sync_global_devices
+from orbax.checkpoint.multihost import sync_global_processes as sync_global_devices
 
 @nnx.jit
 def _model_generate_step(model: LLM, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
@@ -368,7 +369,7 @@ def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
-        enable_async_checkpointing=False,
+        enable_async_checkpointing=True,
     )
     # Use the new API style without additional parameters
     return ocp.CheckpointManager(
@@ -414,14 +415,14 @@ def save_checkpoint(
     ckpt_manager.save(
         step, 
         args=ocp.args.Composite(
-            model=ocp.args.StandardSave(model_state),
-            optimizer=ocp.args.StandardSave(optimizer_state),
+            model=ocp.args.PyTreeSave(model_state),
+            optimizer=ocp.args.PyTreeSave(optimizer_state),
             batch_state=ocp.args.JsonSave(batch_state),
             model_stats=ocp.args.JsonSave(serializable_metrics),
             extra_metadata=ocp.args.JsonSave({})
         )
     )
-    ckpt_manager.wait_until_finished()
+    #ckpt_manager.wait_until_finished()
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
@@ -453,8 +454,8 @@ def load_checkpoint(
     restored = ckpt_manager.restore(
         step, 
         args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(abs_model_state),
-            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
+            model=ocp.args.PyTreeRestore(abs_model_state),
+            optimizer=ocp.args.PyTreeRestore(abs_optimizer_state),
             batch_state=ocp.args.JsonRestore(),
             model_stats=ocp.args.JsonRestore(),
             extra_metadata=ocp.args.JsonRestore()
@@ -594,6 +595,35 @@ def main():
             perplexity=nnx.metrics.Average('perplexity'),
             accuracy=nnx.metrics.Average('accuracy')
         )
+
+        # Save initial checkpoint at step 0 if no checkpoint exists
+        if start_step == 0:
+            print("Saving initial checkpoint at step 0...")
+            initial_metrics = {
+                "train": {
+                    "total_loss": 0.0,
+                    "loss": 0.0,
+                    "router_loss": 0.0,
+                    "perplexity": 0.0,
+                    "accuracy": 0.0
+                },
+                "eval": {
+                    "total_loss": 0.0,
+                    "loss": 0.0,
+                    "router_loss": 0.0,
+                    "perplexity": 0.0,
+                    "accuracy": 0.0
+                },
+                "best_eval_loss": float('inf')
+            }
+            save_checkpoint(
+                ckpt_manager,
+                model,
+                optimizer,
+                0,
+                train_loader,
+                initial_metrics
+            )
 
         sync_global_devices("start_training")
         # Main training loop
