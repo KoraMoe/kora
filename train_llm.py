@@ -368,7 +368,7 @@ def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
-        enable_async_checkpointing=True,
+        enable_async_checkpointing=False,
     )
     # Use the new API style without additional parameters
     return ocp.CheckpointManager(
@@ -384,6 +384,7 @@ def save_checkpoint(
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
+    sync_global_devices("save_checkpoint")
     """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
     # Get states to save
     model_state = nnx.state(model)
@@ -401,8 +402,8 @@ def save_checkpoint(
         args=ocp.args.Composite(
             model=ocp.args.StandardSave(model_state),
             optimizer=ocp.args.StandardSave(optimizer_state),
-            batch_state=ocp.args.StandardSave(batch_state),
-            model_stats=ocp.args.StandardSave(metrics or {})
+            batch_state=ocp.args.JsonSave(batch_state),
+            model_stats=ocp.args.JsonSave(metrics or {})
         )
     )
     ckpt_manager.wait_until_finished()
@@ -439,8 +440,8 @@ def load_checkpoint(
         args=ocp.args.Composite(
             model=ocp.args.StandardRestore(abs_model_state),
             optimizer=ocp.args.StandardRestore(abs_optimizer_state),
-            batch_state=ocp.args.StandardRestore(),
-            model_stats=ocp.args.StandardRestore()
+            batch_state=ocp.args.JsonRestore(),
+            model_stats=ocp.args.JsonRestore()
         )
     )
     
@@ -648,6 +649,7 @@ def main():
                     "eval": eval_results,
                     "best_eval_loss": best_eval_loss
                 }
+
                 save_checkpoint(
                     ckpt_manager, 
                     model, 
