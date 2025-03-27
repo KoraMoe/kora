@@ -394,7 +394,7 @@ def save_checkpoint(
     batch_state = {
         "current_epoch": batch_loader.current_epoch,
         "current_idx": batch_loader.current_idx,
-        "indices": np.array(batch_loader.indices),  # Convert to numpy for serialization
+        "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
     }
     
     ckpt_manager.save(
@@ -459,7 +459,7 @@ def load_checkpoint(
             batch_loader.current_idx = batch_state["current_idx"]
             
             # Handle potential issues with indices
-            indices = batch_state["indices"]
+            indices = np.array(batch_state["indices"])
             if len(indices) > 0:
                 # Ensure indices are within the valid range for the dataset
                 indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
