@@ -240,11 +240,44 @@ class BatchLoader:
         self._shuffle_indices()
         
         # Initialize threading components
-
         self._queue = queue.Queue(maxsize=num_prefetch)
         self._stop_event = threading.Event()
-        self._thread = threading.Thread(target=self._producer_thread, daemon=True)
-        self._thread.start()
+        self._thread_lock = threading.Lock()
+        self._start_producer_thread()
+    
+    def _start_producer_thread(self):
+        """Start a new producer thread with proper locking."""
+        with self._thread_lock:
+            # Stop existing thread if running
+            self._stop_existing_thread()
+            
+            # Clear the queue
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            # Reset stop event
+            self._stop_event.clear()
+            
+            # Start new thread
+            self._thread = threading.Thread(target=self._producer_thread, daemon=True)
+            self._thread.start()
+    
+    def _stop_existing_thread(self):
+        """Safely stop the existing producer thread."""
+        if hasattr(self, '_thread') and self._thread.is_alive():
+            self._stop_event.set()
+            self._thread.join(timeout=5.0)  # Wait up to 5 seconds
+            if self._thread.is_alive():
+                print("Warning: Producer thread did not stop gracefully")
+    
+    def restart(self):
+        """Safely restart the producer thread."""
+        with self._thread_lock:
+            self._stop_existing_thread()
+            self._start_producer_thread()
     
     def _create_batch(self, indices):
         """Create a sharded batch from indices for the current process."""
@@ -293,6 +326,11 @@ class BatchLoader:
                 
                 # Create batch and put in queue
                 batch = self._create_batch(batch_indices)
+                
+                # Check stop event before potentially blocking on queue put
+                if self._stop_event.is_set():
+                    break
+                    
                 self._queue.put(batch)
         except Exception as e:
             import traceback
@@ -303,14 +341,23 @@ class BatchLoader:
     def next(self):
         """Get next batch from the queue."""
         if self._stop_event.is_set():
-            raise RuntimeError("Producer thread encountered an error")
-        return self._queue.get()
+            # Attempt to restart the thread if it died
+            print("Producer thread died, attempting restart...")
+            self.restart()
+            
+        try:
+            # Use a timeout to prevent indefinite blocking
+            batch = self._queue.get(timeout=30.0)
+            return batch
+        except queue.Empty:
+            print("Queue timeout, restarting producer thread...")
+            self.restart()
+            # Try one more time
+            return self._queue.get(timeout=30.0)
     
     def __del__(self):
         """Cleanup when the loader is destroyed."""
-        self._stop_event.set()
-        if hasattr(self, '_thread'):
-            self._thread.join(timeout=1.0)
+        self._stop_existing_thread()
 
 def count_params(model: LLM) -> float:
     """Count total number of trainable parameters in billions."""
@@ -423,8 +470,8 @@ def load_checkpoint(
             else:
                 batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             
-            # Reinitialize the generator with the restored state
-            batch_loader._producer_thread()
+            # Restart the batch loader thread with new state
+            batch_loader.restart()
             
         except Exception as e:
             print(f"Warning: Failed to restore batch loader state: {str(e)}")
@@ -433,7 +480,7 @@ def load_checkpoint(
             batch_loader.current_epoch = 0
             batch_loader.current_idx = 0
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader._producer_thread()
+            batch_loader.restart()
     
     return step, restored.get("model_stats", {})
 
