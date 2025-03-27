@@ -403,7 +403,8 @@ def save_checkpoint(
             model=ocp.args.StandardSave(model_state),
             optimizer=ocp.args.StandardSave(optimizer_state),
             batch_state=ocp.args.JsonSave(batch_state),
-            model_stats=ocp.args.JsonSave(metrics or {})
+            model_stats=ocp.args.JsonSave(metrics or {}),
+            extra_metadata=ocp.args.JsonSave({})
         )
     )
     ckpt_manager.wait_until_finished()
@@ -441,7 +442,8 @@ def load_checkpoint(
             model=ocp.args.StandardRestore(abs_model_state),
             optimizer=ocp.args.StandardRestore(abs_optimizer_state),
             batch_state=ocp.args.JsonRestore(),
-            model_stats=ocp.args.JsonRestore()
+            model_stats=ocp.args.JsonRestore(),
+            extra_metadata=ocp.args.JsonRestore()
         )
     )
     
