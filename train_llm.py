@@ -363,17 +363,18 @@ def count_params(model: LLM) -> float:
             total += param.size
     return total / 1e9  # Convert to billions
 
+
 def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
-    """Create an Orbax checkpoint manager with the new API style."""
+    """Create an Orbax checkpoint manager."""
     os.makedirs(base_dir, exist_ok=True)
+    checkpointer = ocp.StandardCheckpointer()
     options = ocp.CheckpointManagerOptions(
         max_to_keep=max_to_keep,
         create=True,
-        enable_async_checkpointing=True,
     )
-    # Use the new API style without additional parameters
     return ocp.CheckpointManager(
         base_dir,
+        checkpointer,
         options=options,
     )
 
@@ -385,8 +386,7 @@ def save_checkpoint(
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
 ) -> None:
-    sync_global_devices("save_checkpoint")
-    """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
+    """Save the model, optimizer state, current step, and batch state to checkpoint."""
     # Get states to save
     model_state = nnx.state(model)
     optimizer_state = nnx.state(optimizer)
@@ -395,22 +395,19 @@ def save_checkpoint(
     batch_state = {
         "current_epoch": batch_loader.current_epoch,
         "current_idx": batch_loader.current_idx,
-        "indices": batch_loader.indices.tolist(),  # Convert to JSON-serializable list
+        "indices": np.array(batch_loader.indices),
     }
-
+    
+    # Combine everything into one state dict
     ckpt_state = {
         "model": model_state,
         "optimizer": optimizer_state,
         "batch_state": batch_state,
-        "model_stats": metrics,
-        "extra_metadata": {}
+        "model_stats": metrics or {},
     }
     
-    ckpt_manager.save(
-        step, 
-        items=ckpt_state
-    )
-    #ckpt_manager.wait_until_finished()
+    # Save the checkpoint
+    ckpt_manager.save(step, ckpt_state)
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
