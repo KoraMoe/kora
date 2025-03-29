@@ -405,13 +405,17 @@ def load_checkpoint(
     """Load checkpoint into existing model and optimizer if available using new API."""
     # Check if checkpoint exists
     step = ckpt_manager.latest_step()
+    
+    # Sync the step value across all processes to ensure consistency
+    step = sync_global_devices(f"checkpoint_step_{step}", step)
+    
     if step is None:
         print("No checkpoint found, starting from scratch")
         return 0, {}
     
     # Create abstract target based on the existing model and optimizer
     abs_model_state = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
+        ocp.utils.to_shape_dtype_struct,
         nnx.state(model)
     )
 
@@ -497,7 +501,6 @@ def main():
         max_to_keep=5,
         create=True,
         enable_async_checkpointing=False,
-        single_host_load_and_broadcast=True,
     )
     
     # Define item names for checkpoint
