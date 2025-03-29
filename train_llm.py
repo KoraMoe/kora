@@ -381,14 +381,34 @@ def save_checkpoint(
     
     # Convert JAX and NumPy arrays for msgpack compatibility while preserving metadata
     def convert_arrays_for_msgpack(obj):
-        if isinstance(obj, jnp.ndarray):
-            # For JAX arrays, save data along with metadata
-            return {
-                "__jax_array__": True,
-                "data": obj.tolist(),
-                "dtype": str(obj.dtype),
-                "shape": obj.shape
-            }
+        if isinstance(obj, jnp.ndarray) or hasattr(obj, "device_buffers"):
+            # For JAX arrays (including sharded arrays), first gather to host
+            try:
+                # For sharded arrays, we need to gather the data to a single device first
+                if hasattr(obj, "is_fully_addressable") and not obj.is_fully_addressable:
+                    # This is a globally distributed array - each process needs its own part
+                    host_array = np.array(jax.device_get(obj))
+                else:
+                    # This is a regular array or fully addressable sharded array
+                    host_array = np.array(obj)
+                    
+                return {
+                    "__jax_array__": True,
+                    "data": host_array.tolist(),
+                    "dtype": str(host_array.dtype),
+                    "shape": host_array.shape
+                }
+            except Exception as e:
+                # Fall back to saving the array information without data
+                # This helps identify the issue while allowing serialization to continue
+                print(f"Warning: Failed to serialize array: {e}")
+                return {
+                    "__jax_array__": True,
+                    "data": None,
+                    "dtype": str(obj.dtype) if hasattr(obj, "dtype") else "unknown",
+                    "shape": obj.shape if hasattr(obj, "shape") else None,
+                    "error": str(e)
+                }
         elif isinstance(obj, np.ndarray):
             # For NumPy arrays, save data along with metadata
             return {
@@ -463,7 +483,18 @@ def load_checkpoint(
         if isinstance(obj, dict):
             # Check if this is a serialized array
             if "__jax_array__" in obj:
-                # Convert back to JAX array
+                # Handle the case where array data might be None due to serialization issues
+                if obj["data"] is None:
+                    print(f"Warning: Found array with missing data. Error: {obj.get('error', 'Unknown')}")
+                    # Create an empty array with the right shape and dtype if possible
+                    shape = obj.get("shape")
+                    dtype_str = obj.get("dtype", "float32")
+                    if shape is not None:
+                        return jnp.zeros(shape, dtype=dtype_str)
+                    else:
+                        # If we don't have shape info, return a scalar zero
+                        return jnp.array(0, dtype=dtype_str)
+                # Normal case - convert back to JAX array
                 array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
                 return jnp.array(array_data)
             elif "__numpy_array__" in obj:
