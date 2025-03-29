@@ -470,116 +470,164 @@ def load_checkpoint(
     
     # Extract step numbers from filenames and find the latest
     steps = [int(f.split("_")[1].split(".")[0]) for f in checkpoint_files]
-    latest_step = max(steps)
-    latest_file = f"checkpoint_{latest_step}.msgpack"
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, latest_file)
+    steps.sort(reverse=True)  # Sort in descending order to try newest first
     
-    print(f"Loading checkpoint from {checkpoint_path}")
-    
-    # Load checkpoint data using msgpack
-    with open(checkpoint_path, "rb") as f:
-        checkpoint_data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
-    
-    # Convert structured arrays back to appropriate types
-    def convert_from_msgpack(obj):
-        if isinstance(obj, dict):
-            # Check if this is a serialized array
-            if "__jax_array__" in obj:
-                # Handle the case where array data might be None due to serialization issues
-                if obj["data"] is None:
-                    print(f"Warning: Found array with missing data. Error: {obj.get('error', 'Unknown')}")
-                    # Create an empty array with the right shape and dtype if possible
-                    shape = obj.get("shape")
-                    dtype_str = obj.get("dtype", "float32")
-                    if shape is not None:
-                        return jnp.zeros(shape, dtype=dtype_str)
-                    else:
-                        # If we don't have shape info, return a scalar zero
-                        return jnp.array(0, dtype=dtype_str)
-                # Normal case - convert back to JAX array
-                array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
-                return jnp.array(array_data)
-            elif "__numpy_array__" in obj:
-                # Convert back to NumPy array
-                return np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
-            else:
-                # Regular dictionary
-                return {k: convert_from_msgpack(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert_from_msgpack(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(convert_from_msgpack(item) for item in obj)
-        else:
-            return obj
-    
-    # Create abstract model state
-    model_state = nnx.state(model)
-    # Get the named sharding for the model based on the mesh
-    named_sharding = nnx.get_named_sharding(model_state, mesh)
-
-    # Process model state
-    model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
-
-    # Ensure we have a dictionary type for the state
-    if not isinstance(model_state_dict, dict):
-        raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
-
-    # Replace abstract state with restored state
-    nnx.replace_by_pure_dict(model_state, model_state_dict)
-
-    # Apply sharding constraints to the state to ensure it's properly distributed
-    with mesh:
-        # Use jax.device_put with tree_map to apply sharding to each array in the state
-        sharded_state = jax.tree.map(
-            lambda x, s: jax.device_put(x, s) if isinstance(x, jnp.ndarray) else x,
-            model_state, named_sharding
-        )
+    # Try to load checkpoints starting from the newest, fallback to older ones if needed
+    for step in steps:
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
+        print(f"Attempting to load checkpoint from {checkpoint_path}")
         
-        # Update the model with the sharded state
-        nnx.update(model, sharded_state)
-    
-    # Restore batch loader state if provided
-    if batch_loader is not None and "batch_state" in checkpoint_data:
         try:
-            batch_state = checkpoint_data["batch_state"]
-            batch_loader.current_epoch = batch_state["current_epoch"]
-            batch_loader.current_idx = batch_state["current_idx"]
+            # Load checkpoint data using msgpack
+            with open(checkpoint_path, "rb") as f:
+                try:
+                    checkpoint_data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
+                except (ValueError, msgpack.exceptions.UnpackException) as e:
+                    print(f"Failed to unpack checkpoint {checkpoint_path}: {str(e)}")
+                    # Delete the corrupted checkpoint file
+                    print(f"Deleting corrupted checkpoint file: {checkpoint_path}")
+                    try:
+                        os.remove(checkpoint_path)
+                    except Exception as delete_error:
+                        print(f"Warning: Could not delete corrupted checkpoint: {delete_error}")
+                    continue  # Try the next checkpoint
             
-            # Handle indices - should already be converted from msgpack
-            indices_data = convert_from_msgpack(batch_state["indices"])
-            
-            # Ensure indices is a NumPy array
-            if not isinstance(indices_data, np.ndarray):
-                # Convert to numpy array if it's not already
-                if hasattr(indices_data, "__len__"):
-                    indices = np.array(indices_data, dtype=np.int32)
+            # Convert structured arrays back to appropriate types
+            def convert_from_msgpack(obj):
+                if isinstance(obj, dict):
+                    # Check if this is a serialized array
+                    if "__jax_array__" in obj:
+                        # Handle the case where array data might be None due to serialization issues
+                        if obj["data"] is None:
+                            print(f"Warning: Found array with missing data. Error: {obj.get('error', 'Unknown')}")
+                            # Create an empty array with the right shape and dtype if possible
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                # If we don't have shape info, return a scalar zero
+                                return jnp.array(0, dtype=dtype_str)
+                        # Normal case - convert back to JAX array
+                        try:
+                            array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                            return jnp.array(array_data)
+                        except Exception as array_error:
+                            print(f"Error converting array: {array_error}")
+                            # Fallback to zeros with appropriate shape
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                return jnp.array(0, dtype=dtype_str)
+                    elif "__numpy_array__" in obj:
+                        # Convert back to NumPy array
+                        try:
+                            return np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                        except Exception as np_error:
+                            print(f"Error converting numpy array: {np_error}")
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return np.zeros(shape, dtype=dtype_str)
+                            else:
+                                return np.array(0, dtype=dtype_str)
+                    else:
+                        # Regular dictionary
+                        return {k: convert_from_msgpack(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_from_msgpack(item) for item in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(convert_from_msgpack(item) for item in obj)
                 else:
-                    # Fallback to creating new indices
-                    print("Warning: Invalid indices data in checkpoint, regenerating")
-                    indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            else:
-                indices = indices_data
+                    return obj
             
-            if len(indices) > 0:
-                # Ensure indices are within the valid range for the dataset
-                indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
-                batch_loader.indices = indices
-            else:
-                batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            
-            # Restart the batch loader thread with new state
-            batch_loader._start_producer_thread()
-            
+            try:
+                # Create abstract model state
+                model_state = nnx.state(model)
+                # Get the named sharding for the model based on the mesh
+                named_sharding = nnx.get_named_sharding(model_state, mesh)
+
+                # Process model state
+                model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
+
+                # Ensure we have a dictionary type for the state
+                if not isinstance(model_state_dict, dict):
+                    raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
+
+                # Replace abstract state with restored state
+                nnx.replace_by_pure_dict(model_state, model_state_dict)
+
+                # Apply sharding constraints to the state to ensure it's properly distributed
+                with mesh:
+                    # Use jax.device_put with tree_map to apply sharding to each array in the state
+                    sharded_state = jax.tree.map(
+                        lambda x, s: jax.device_put(x, s) if isinstance(x, jnp.ndarray) else x,
+                        model_state, named_sharding
+                    )
+                    
+                    # Update the model with the sharded state
+                    nnx.update(model, sharded_state)
+                
+                # Restore batch loader state if provided
+                if batch_loader is not None and "batch_state" in checkpoint_data:
+                    try:
+                        batch_state = checkpoint_data["batch_state"]
+                        batch_loader.current_epoch = batch_state["current_epoch"]
+                        batch_loader.current_idx = batch_state["current_idx"]
+                        
+                        # Handle indices - should already be converted from msgpack
+                        indices_data = convert_from_msgpack(batch_state["indices"])
+                        
+                        # Ensure indices is a NumPy array
+                        if not isinstance(indices_data, np.ndarray):
+                            # Convert to numpy array if it's not already
+                            if hasattr(indices_data, "__len__"):
+                                indices = np.array(indices_data, dtype=np.int64)
+                            else:
+                                # Fallback to creating new indices
+                                print("Warning: Invalid indices data in checkpoint, regenerating")
+                                indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples).astype(np.int64)
+                        else:
+                            # Ensure the right dtype
+                            indices = indices_data.astype(np.int64)
+                        
+                        if len(indices) > 0:
+                            # Ensure indices are within the valid range for the dataset
+                            indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
+                            batch_loader.indices = indices
+                        else:
+                            batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+                        
+                        # Restart the batch loader thread with new state
+                        batch_loader._start_producer_thread()
+                        
+                    except Exception as e:
+                        print(f"Warning: Failed to restore batch loader state: {str(e)}")
+                        print("Reinitializing batch loader...")
+                        # Reset the batch loader to initial state
+                        batch_loader.current_epoch = 0
+                        batch_loader.current_idx = 0
+                        batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+                        batch_loader._start_producer_thread()
+                
+                print(f"Successfully loaded checkpoint from step {step}")
+                return step
+                
+            except Exception as e:
+                print(f"Error processing checkpoint {checkpoint_path}: {str(e)}")
+                print("Trying an older checkpoint...")
+                continue
+                
         except Exception as e:
-            print(f"Warning: Failed to restore batch loader state: {str(e)}")
-            print("Reinitializing batch loader...")
-            # Reset the batch loader to initial state
-            batch_loader.current_epoch = 0
-            batch_loader.current_idx = 0
-            batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader._start_producer_thread()
+            print(f"Error opening checkpoint file {checkpoint_path}: {str(e)}")
+            print("Trying an older checkpoint...")
+            continue
     
-    return latest_step
+    # If we've reached here, all checkpoints failed to load
+    print("All checkpoints failed to load. Starting from scratch.")
+    return 0
 
 def main():
     train_dataset, test_dataset = load_dataset()
