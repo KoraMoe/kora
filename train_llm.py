@@ -2,6 +2,9 @@ import os
 import queue
 import threading
 
+import jax.experimental
+import jax.experimental.multihost_utils
+
 from config import *
 import numpy as np
 import jax
@@ -373,6 +376,8 @@ def save_checkpoint(
     """Save the model, optimizer state, current step, and batch state to checkpoint."""
     # Get states to save
     model_state = nnx.state(model)
+
+    local_model_state = jax.experimental.multihost_utils.process_allgather(model_state)
     
     # Create batch state dict to save batch loader state
     batch_state = {
@@ -384,7 +389,7 @@ def save_checkpoint(
     ckpt_manager.save(
         step,
         args=ocp.args.Composite(
-            model=ocp.args.StandardSave(model_state),
+            model=ocp.args.StandardSave(local_model_state),
             batch_state=ocp.args.StandardSave(batch_state),
             model_stats=ocp.args.JsonSave(metrics or {}),
         )
