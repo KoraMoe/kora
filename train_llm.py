@@ -366,7 +366,6 @@ def count_params(model: LLM) -> float:
 def save_checkpoint(
     ckpt_manager: ocp.CheckpointManager, 
     model: LLM, 
-    optimizer: nnx.Optimizer, 
     step: int,
     batch_loader: BatchLoader,
     metrics: Optional[Dict[str, Any]] = None
@@ -374,7 +373,6 @@ def save_checkpoint(
     """Save the model, optimizer state, current step, and batch state to checkpoint."""
     # Get states to save
     model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
     
     # Create batch state dict to save batch loader state
     batch_state = {
@@ -383,18 +381,14 @@ def save_checkpoint(
         "indices": np.array(batch_loader.indices),
     }
     
-
     ckpt_manager.save(
         step,
         args=ocp.args.Composite(
             model=ocp.args.StandardSave(model_state),
-            optimizer=ocp.args.StandardSave(optimizer_state),
             batch_state=ocp.args.StandardSave(batch_state),
             model_stats=ocp.args.JsonSave(metrics or {}),
         )
     )
-        
-    # Wait for checkpoint to be saved
     ckpt_manager.wait_until_finished()
     
     print(f"Checkpoint saved at step {step}")
@@ -402,7 +396,6 @@ def save_checkpoint(
 def load_checkpoint(
     ckpt_manager: ocp.CheckpointManager,
     model: LLM,
-    optimizer: nnx.Optimizer,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
     """Load checkpoint into existing model and optimizer if available using new API."""
@@ -417,11 +410,6 @@ def load_checkpoint(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
         nnx.state(model)
     )
-    
-    abs_optimizer_state = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
-        nnx.state(optimizer)
-    )
 
     # Restore checkpoint using the new Composite args API with 'with' statement
     print(f"Restoring checkpoint from step {step}")
@@ -429,7 +417,6 @@ def load_checkpoint(
         step,
         args=ocp.args.Composite(
             model=ocp.args.StandardRestore(abs_model_state),
-            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
             batch_state=ocp.args.StandardRestore(),
             model_stats=ocp.args.JsonRestore(),
         )
@@ -437,7 +424,6 @@ def load_checkpoint(
     
     # Update model and optimizer states
     nnx.state(model).update(restored["model"])
-    nnx.state(optimizer).update(restored["optimizer"])
     
     # Restore batch loader state if provided
     if batch_loader is not None:
@@ -564,7 +550,7 @@ def main():
             metadata=global_metadata,
         ) as ckpt_manager:
             # Try to restore from checkpoint
-            start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
+            start_step, metrics = load_checkpoint(ckpt_manager, model, train_loader)
             print(f"Process {jax.process_index()}: Restored checkpoint state")
             
             # Initialize best eval loss from checkpoint metrics or default
@@ -612,7 +598,6 @@ def main():
                 save_checkpoint(
                     ckpt_manager,
                     model,
-                    optimizer,
                     0,
                     train_loader,
                     initial_metrics
@@ -692,7 +677,6 @@ def main():
                     save_checkpoint(
                         ckpt_manager, 
                         model, 
-                        optimizer, 
                         step + 1,  # Save as the next step
                         train_loader,
                         metrics
