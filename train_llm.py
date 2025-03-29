@@ -363,21 +363,6 @@ def count_params(model: LLM) -> float:
             total += param.size
     return total / 1e9  # Convert to billions
 
-
-def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
-    """Create an Orbax checkpoint manager."""
-    os.makedirs(base_dir, exist_ok=True)
-    checkpointer = ocp.StandardCheckpointer()
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_to_keep,
-        create=True,
-    )
-    return ocp.CheckpointManager(
-        base_dir,
-        checkpointer,
-        options=options,
-    )
-
 def save_checkpoint(
     ckpt_manager: ocp.CheckpointManager, 
     model: LLM, 
@@ -398,16 +383,22 @@ def save_checkpoint(
         "indices": np.array(batch_loader.indices),
     }
     
-    # Combine everything into one state dict
-    ckpt_state = {
-        "model": model_state,
-        "optimizer": optimizer_state,
-        "batch_state": batch_state,
-        "model_stats": metrics or {},
-    }
+    # Use 'with' statement for the checkpoint manager
+    with ckpt_manager:
+        # Save the checkpoint using the new Composite args API
+        ckpt_manager.save(
+            step,
+            args=ocp.args.Composite(
+                model=ocp.args.StandardSave(model_state),
+                optimizer=ocp.args.StandardSave(optimizer_state),
+                batch_state=ocp.args.StandardSave(batch_state),
+                model_stats=ocp.args.JsonSave(metrics or {}),
+            )
+        )
+        
+        # Wait for checkpoint to be saved
+        ckpt_manager.wait_until_finished()
     
-    # Save the checkpoint
-    ckpt_manager.save(step, ckpt_state)
     print(f"Checkpoint saved at step {step}")
 
 def load_checkpoint(
@@ -434,24 +425,18 @@ def load_checkpoint(
         nnx.state(optimizer)
     )
 
-    abs_ckpt_state = {
-        "model": abs_model_state,
-        "optimizer": abs_optimizer_state,
-        "batch_state": {
-            "current_epoch": 0,
-            "current_idx": 0,
-            "indices": []
-        },
-        "model_stats": {},
-        "extra_metadata": {}
-    }
-
-    # Restore checkpoint
+    # Restore checkpoint using the new Composite args API with 'with' statement
     print(f"Restoring checkpoint from step {step}")
-    restored = ckpt_manager.restore(
-        step,
-        items=abs_ckpt_state
-    )
+    with ckpt_manager:
+        restored = ckpt_manager.restore(
+            step,
+            args=ocp.args.Composite(
+                model=ocp.args.StandardRestore(abs_model_state),
+                optimizer=ocp.args.StandardRestore(abs_optimizer_state),
+                batch_state=ocp.args.StandardRestore(),
+                model_stats=ocp.args.JsonRestore(),
+            )
+        )
     
     # Update model and optimizer states
     nnx.state(model).update(restored["model"])
@@ -520,8 +505,20 @@ def main():
     print(f"Process {jax.process_index()}: Created data loaders")
     sync_global_devices("data_loaders_created")
 
-    # Create checkpoint manager
-    ckpt_manager = create_checkpoint_manager(CHECKPOINT_DIR)
+    # Create checkpoint manager options
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=5,
+        create=True,
+    )
+    
+    # Define item names for checkpoint
+    item_names = ("model", "optimizer", "batch_state", "model_stats")
+    
+    # Global metadata
+    global_metadata = {
+        "framework": "jax",
+        "model_type": "llm",
+    }
     
     # Calculate training steps
     num_epochs = NUM_EPOCHS
@@ -561,143 +558,151 @@ def main():
         print(f"Process {jax.process_index()}: Created optimizer")
         sync_global_devices("optimizer_created")
         
-        # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
-        print(f"Process {jax.process_index()}: Restored checkpoint state")
-        
-        # Initialize best eval loss from checkpoint metrics or default
-        best_eval_loss = metrics.get("best_eval_loss", float('inf'))
-        if start_step > 0:
-            print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
-        
-        # Create metrics tracker
-        train_metrics = nnx.MultiMetric(
-            total_loss=nnx.metrics.Average('total_loss'),
-            loss=nnx.metrics.Average('loss'),
-            router_loss=nnx.metrics.Average('router_loss'),
-            perplexity=nnx.metrics.Average('perplexity'),
-            accuracy=nnx.metrics.Average('accuracy')
-        )
-        
-        eval_metrics = nnx.MultiMetric(
-            total_loss=nnx.metrics.Average('total_loss'),
-            loss=nnx.metrics.Average('loss'),
-            router_loss=nnx.metrics.Average('router_loss'),
-            perplexity=nnx.metrics.Average('perplexity'),
-            accuracy=nnx.metrics.Average('accuracy')
-        )
-
-        # Save initial checkpoint at step 0 if no checkpoint exists
-        if start_step == 0:
-            print("Saving initial checkpoint at step 0...")
-            initial_metrics = {
-                "train": {
-                    "total_loss": 0.0,
-                    "loss": 0.0,
-                    "router_loss": 0.0,
-                    "perplexity": 0.0,
-                    "accuracy": 0.0
-                },
-                "eval": {
-                    "total_loss": 0.0,
-                    "loss": 0.0,
-                    "router_loss": 0.0,
-                    "perplexity": 0.0,
-                    "accuracy": 0.0
-                },
-                "best_eval_loss": float('inf')
-            }
-            save_checkpoint(
-                ckpt_manager,
-                model,
-                optimizer,
-                0,
-                train_loader,
-                initial_metrics
+        # Create the checkpoint manager with 'with' statement
+        path = ocp.test_utils.erase_and_create_empty(CHECKPOINT_DIR)
+        with ocp.CheckpointManager(
+            path,
+            item_names=item_names,
+            options=options,
+            metadata=global_metadata,
+        ) as ckpt_manager:
+            # Try to restore from checkpoint
+            start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
+            print(f"Process {jax.process_index()}: Restored checkpoint state")
+            
+            # Initialize best eval loss from checkpoint metrics or default
+            best_eval_loss = metrics.get("best_eval_loss", float('inf'))
+            if start_step > 0:
+                print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
+            
+            # Create metrics tracker
+            train_metrics = nnx.MultiMetric(
+                total_loss=nnx.metrics.Average('total_loss'),
+                loss=nnx.metrics.Average('loss'),
+                router_loss=nnx.metrics.Average('router_loss'),
+                perplexity=nnx.metrics.Average('perplexity'),
+                accuracy=nnx.metrics.Average('accuracy')
+            )
+            
+            eval_metrics = nnx.MultiMetric(
+                total_loss=nnx.metrics.Average('total_loss'),
+                loss=nnx.metrics.Average('loss'),
+                router_loss=nnx.metrics.Average('router_loss'),
+                perplexity=nnx.metrics.Average('perplexity'),
+                accuracy=nnx.metrics.Average('accuracy')
             )
 
-        sync_global_devices("start_training")
-        # Main training loop
-        progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
-        for step in range(start_step, total_steps):
-            batch = train_loader.next()
-            
-            train_step(model, optimizer, train_metrics, batch)
-            progress_bar.update(1)
-            
-            if step  % SAMPLE_STEPS == 0:
-                print(f"\nSampling text at step {step + 1}:")
-                generated_text = greedy_sample(model, tokenizer)
-                print(f"Generated: {generated_text}\n")
-                if jax.process_index() == 0:
-                    wandb.log({
-                        "generated_text": generated_text,
-                        "step": step
-                    })
-            
-            if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
-                metrics_values = train_metrics.compute()
-                train_metrics.reset()
-                
-                progress_bar.set_postfix({
-                        'loss': f"{metrics_values['loss']:.4f}",
-                        'ppl': f"{metrics_values['perplexity']:.4f}",
-                        'lr': f"{lr_schedule(step):.6f}"
-                })
-
-                if jax.process_index() == 0:
-                    wandb.log({
-                        f"train/{k}": v for k, v in metrics_values.items()
-                    } | {
-                        'train/step': step,
-                        'train/epoch': step / steps_per_epoch
-                    })
-            
-            # Evaluate and save checkpoint periodically
-            if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
-                # Evaluate
-                eval_metrics.reset()
-                for _ in range(test_loader.steps_per_epoch):
-                    batch = test_loader.next()
-                    eval_step(model, eval_metrics, batch)
-                
-                eval_results = eval_metrics.compute()
-                eval_loss = eval_results['loss']
-                
-                # Print eval results
-                print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
-                      " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
-                
-                # Track best model
-                if eval_loss < best_eval_loss:
-                    best_eval_loss = eval_loss
-                    print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
-                
-                if jax.process_index() == 0:
-                    wandb.log({
-                        f"eval/{k}": v for k, v in eval_results.items()
-                    } | {
-                        'eval/step': step,
-                        'eval/epoch': step / steps_per_epoch
-                    })
-                # Save checkpoint with metrics
-                metrics = {
-                    "train": metrics_values,
-                    "eval": eval_results,
-                    "best_eval_loss": best_eval_loss
+            # Save initial checkpoint at step 0 if no checkpoint exists
+            if start_step == 0:
+                print("Saving initial checkpoint at step 0...")
+                initial_metrics = {
+                    "train": {
+                        "total_loss": 0.0,
+                        "loss": 0.0,
+                        "router_loss": 0.0,
+                        "perplexity": 0.0,
+                        "accuracy": 0.0
+                    },
+                    "eval": {
+                        "total_loss": 0.0,
+                        "loss": 0.0,
+                        "router_loss": 0.0,
+                        "perplexity": 0.0,
+                        "accuracy": 0.0
+                    },
+                    "best_eval_loss": float('inf')
                 }
-
                 save_checkpoint(
-                    ckpt_manager, 
-                    model, 
-                    optimizer, 
-                    step + 1,  # Save as the next step
+                    ckpt_manager,
+                    model,
+                    optimizer,
+                    0,
                     train_loader,
-                    metrics
+                    initial_metrics
                 )
+
+            sync_global_devices("start_training")
+            # Main training loop
+            progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
+            for step in range(start_step, total_steps):
+                batch = train_loader.next()
                 
-        progress_bar.close()
-        print("Training complete!")
+                train_step(model, optimizer, train_metrics, batch)
+                progress_bar.update(1)
+                
+                if step  % SAMPLE_STEPS == 0:
+                    print(f"\nSampling text at step {step + 1}:")
+                    generated_text = greedy_sample(model, tokenizer)
+                    print(f"Generated: {generated_text}\n")
+                    if jax.process_index() == 0:
+                        wandb.log({
+                            "generated_text": generated_text,
+                            "step": step
+                        })
+                
+                if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
+                    metrics_values = train_metrics.compute()
+                    train_metrics.reset()
+                    
+                    progress_bar.set_postfix({
+                            'loss': f"{metrics_values['loss']:.4f}",
+                            'ppl': f"{metrics_values['perplexity']:.4f}",
+                            'lr': f"{lr_schedule(step):.6f}"
+                    })
+
+                    if jax.process_index() == 0:
+                        wandb.log({
+                            f"train/{k}": v for k, v in metrics_values.items()
+                        } | {
+                            'train/step': step,
+                            'train/epoch': step / steps_per_epoch
+                        })
+                
+                # Evaluate and save checkpoint periodically
+                if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
+                    # Evaluate
+                    eval_metrics.reset()
+                    for _ in range(test_loader.steps_per_epoch):
+                        batch = test_loader.next()
+                        eval_step(model, eval_metrics, batch)
+                    
+                    eval_results = eval_metrics.compute()
+                    eval_loss = eval_results['loss']
+                    
+                    # Print eval results
+                    print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
+                          " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
+                    
+                    # Track best model
+                    if eval_loss < best_eval_loss:
+                        best_eval_loss = eval_loss
+                        print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
+                    
+                    if jax.process_index() == 0:
+                        wandb.log({
+                            f"eval/{k}": v for k, v in eval_results.items()
+                        } | {
+                            'eval/step': step,
+                            'eval/epoch': step / steps_per_epoch
+                        })
+                    # Save checkpoint with metrics
+                    metrics = {
+                        "train": metrics_values,
+                        "eval": eval_results,
+                        "best_eval_loss": best_eval_loss
+                    }
+
+                    save_checkpoint(
+                        ckpt_manager, 
+                        model, 
+                        optimizer, 
+                        step + 1,  # Save as the next step
+                        train_loader,
+                        metrics
+                    )
+                    
+            progress_bar.close()
+            print("Training complete!")
 
 if __name__ == "__main__":
     main()
