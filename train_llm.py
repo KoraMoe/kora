@@ -407,7 +407,7 @@ def load_checkpoint(
     step = ckpt_manager.latest_step()
     
     # Sync the step value across all processes to ensure consistency
-    step = sync_global_devices(f"checkpoint_step_{step}", step)
+    step = sync_global_devices("step" + str(step))
     
     if step is None:
         print("No checkpoint found, starting from scratch")
