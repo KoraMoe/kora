@@ -548,7 +548,9 @@ def main():
         sync_global_devices("optimizer_created")
         
         # Create the checkpoint manager with 'with' statement
-        path = ocp.test_utils.erase_and_create_empty(CHECKPOINT_DIR)
+        path = os.path.join(CHECKPOINT_DIR)
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
         with ocp.CheckpointManager(
             path,
             item_names=item_names,
