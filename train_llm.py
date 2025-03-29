@@ -19,10 +19,9 @@ from model import LLM
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from datasets import load_from_disk
-import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
-#from jax.experimental.multihost_utils import sync_global_devices
-from orbax.checkpoint.multihost import sync_global_processes as sync_global_devices
+from jax.experimental.multihost_utils import sync_global_devices
+import msgpack
 
 @nnx.jit
 def _model_generate_step(model: LLM, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
@@ -367,7 +366,6 @@ def count_params(model: LLM) -> float:
     return total / 1e9  # Convert to billions
 
 def save_checkpoint(
-    ckpt_manager: ocp.CheckpointManager, 
     model: LLM, 
     step: int,
     batch_loader: BatchLoader,
@@ -378,70 +376,149 @@ def save_checkpoint(
     model_state = nnx.state(model)
 
     local_model_state = jax.experimental.multihost_utils.process_allgather(model_state)
+
+    local_model_state_dict = local_model_state.to_pure_dict()
+    
+    # Convert JAX and NumPy arrays for msgpack compatibility while preserving metadata
+    def convert_arrays_for_msgpack(obj):
+        if isinstance(obj, jnp.ndarray):
+            # For JAX arrays, save data along with metadata
+            return {
+                "__jax_array__": True,
+                "data": obj.tolist(),
+                "dtype": str(obj.dtype),
+                "shape": obj.shape
+            }
+        elif isinstance(obj, np.ndarray):
+            # For NumPy arrays, save data along with metadata
+            return {
+                "__numpy_array__": True,
+                "data": obj.tolist(),
+                "dtype": str(obj.dtype),
+                "shape": obj.shape
+            }
+        elif isinstance(obj, dict):
+            return {k: convert_arrays_for_msgpack(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_arrays_for_msgpack(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_arrays_for_msgpack(item) for item in obj)
+        else:
+            return obj
+    
+    local_model_state_dict = convert_arrays_for_msgpack(local_model_state_dict)
     
     # Create batch state dict to save batch loader state
     batch_state = {
         "current_epoch": batch_loader.current_epoch,
         "current_idx": batch_loader.current_idx,
-        "indices": np.array(batch_loader.indices),
+        "indices": convert_arrays_for_msgpack(batch_loader.indices),
     }
     
-    ckpt_manager.save(
-        step,
-        args=ocp.args.Composite(
-            model=ocp.args.StandardSave(local_model_state),
-            batch_state=ocp.args.StandardSave(batch_state),
-            model_stats=ocp.args.JsonSave(metrics or {}),
-        )
-    )
+    # Combine all data into a single dictionary
+    checkpoint_data = {
+        "model_state": local_model_state_dict,
+        "batch_state": batch_state,
+        "metrics": metrics or {},
+        "step": step
+    }
     
-    print(f"Checkpoint saved at step {step}")
+    # Save to a single file using msgpack
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
+    
+    with open(checkpoint_path, "wb") as f:
+        f.write(msgpack.packb(checkpoint_data, use_bin_type=True))
+    
+    print(f"Checkpoint saved at step {step} to {checkpoint_path}")
 
 def load_checkpoint(
-    ckpt_manager: ocp.CheckpointManager,
     model: LLM,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
-    """Load checkpoint into existing model and optimizer if available using new API."""
-    # Check if checkpoint exists
-    step = ckpt_manager.latest_step()
+    """Load checkpoint into existing model and optimizer if available using msgpack."""
+    # Find the latest checkpoint
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
     
-    # Sync the step value across all processes to ensure consistency
-    sync_global_devices(f"checkpoint_step")
-    
-    if step is None:
+    if not checkpoint_files:
         print("No checkpoint found, starting from scratch")
         return 0, {}
     
-    # Create abstract target based on the existing model and optimizer
-    abs_model_state = jax.tree.map(
-        ocp.utils.to_shape_dtype_struct,
-        nnx.state(model)
-    )
-
-    # Restore checkpoint using the new Composite args API with 'with' statement
-    print(f"Restoring checkpoint from step {step}")
-    restored = ckpt_manager.restore(
-        step,
-        args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(abs_model_state),
-            batch_state=ocp.args.StandardRestore(),
-            model_stats=ocp.args.JsonRestore(),
-        )
-    )
+    # Extract step numbers from filenames and find the latest
+    steps = [int(f.split("_")[1].split(".")[0]) for f in checkpoint_files]
+    latest_step = max(steps)
+    latest_file = f"checkpoint_{latest_step}.msgpack"
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, latest_file)
     
-    # Update model and optimizer states
-    nnx.state(model).update(restored["model"])
+    print(f"Loading checkpoint from {checkpoint_path}")
+    
+    # Load checkpoint data using msgpack
+    with open(checkpoint_path, "rb") as f:
+        checkpoint_data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
+    
+    # Convert structured arrays back to appropriate types
+    def convert_from_msgpack(obj):
+        if isinstance(obj, dict):
+            # Check if this is a serialized array
+            if "__jax_array__" in obj:
+                # Convert back to JAX array
+                array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                return jnp.array(array_data)
+            elif "__numpy_array__" in obj:
+                # Convert back to NumPy array
+                return np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+            else:
+                # Regular dictionary
+                return {k: convert_from_msgpack(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_from_msgpack(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_from_msgpack(item) for item in obj)
+        else:
+            return obj
+    
+    # Process model state
+    model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
+    
+    # Ensure we have a dictionary type for the state
+    if not isinstance(model_state_dict, dict):
+        raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
+    
+    # Create abstract model state
+    graphdef, abstract_state = nnx.split(model)
+    
+    # Replace abstract state with restored state
+    nnx.replace_by_pure_dict(abstract_state, model_state_dict)
+    
+    # Merge back to create fully restored model
+    restored_model = nnx.merge(graphdef, abstract_state)
+    
+    # Update the provided model with restored state
+    nnx.update(model, nnx.state(restored_model))
     
     # Restore batch loader state if provided
-    if batch_loader is not None:
+    if batch_loader is not None and "batch_state" in checkpoint_data:
         try:
-            batch_state = restored["batch_state"]
+            batch_state = checkpoint_data["batch_state"]
             batch_loader.current_epoch = batch_state["current_epoch"]
             batch_loader.current_idx = batch_state["current_idx"]
             
-            # Handle potential issues with indices
-            indices = np.array(batch_state["indices"])
+            # Handle indices - should already be converted from msgpack
+            indices_data = convert_from_msgpack(batch_state["indices"])
+            
+            # Ensure indices is a NumPy array
+            if not isinstance(indices_data, np.ndarray):
+                # Convert to numpy array if it's not already
+                if hasattr(indices_data, "__len__"):
+                    indices = np.array(indices_data, dtype=np.int32)
+                else:
+                    # Fallback to creating new indices
+                    print("Warning: Invalid indices data in checkpoint, regenerating")
+                    indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+            else:
+                indices = indices_data
+            
             if len(indices) > 0:
                 # Ensure indices are within the valid range for the dataset
                 indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
@@ -461,7 +538,7 @@ def load_checkpoint(
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             batch_loader._start_producer_thread()
     
-    return step, restored.get("model_stats", {})
+    return latest_step, checkpoint_data.get("metrics", {})
 
 def main():
     train_dataset, test_dataset = load_dataset()
@@ -495,22 +572,6 @@ def main():
     test_loader = BatchLoader(dataset=test_dataset, batch_size=BATCH_SIZE, data_spec=data_spec, seed=43)
     print(f"Process {jax.process_index()}: Created data loaders")
     sync_global_devices("data_loaders_created")
-
-    # Create checkpoint manager options
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=5,
-        create=True,
-        enable_async_checkpointing=False,
-    )
-    
-    # Define item names for checkpoint
-    item_names = ("model", "optimizer", "batch_state", "model_stats")
-    
-    # Global metadata
-    global_metadata = {
-        "framework": "jax",
-        "model_type": "llm",
-    }
     
     # Calculate training steps
     num_epochs = NUM_EPOCHS
@@ -549,152 +610,116 @@ def main():
         )
         print(f"Process {jax.process_index()}: Created optimizer")
         sync_global_devices("optimizer_created")
+
+        # Try to restore from checkpoint
+        start_step, metrics = load_checkpoint(model, train_loader)
+        print(f"Process {jax.process_index()}: Restored checkpoint state")
         
-        # Create the checkpoint manager with 'with' statement
-        path = os.path.join(CHECKPOINT_DIR)
-        if not os.path.exists(path):
-            os.makedirs(path, exist_ok=True)
-        with ocp.CheckpointManager(
-            path,
-            item_names=item_names,
-            options=options,
-            metadata=global_metadata,
-        ) as ckpt_manager:
-            # Try to restore from checkpoint
-            start_step, metrics = load_checkpoint(ckpt_manager, model, train_loader)
-            print(f"Process {jax.process_index()}: Restored checkpoint state")
+        # Initialize best eval loss from checkpoint metrics or default
+        best_eval_loss = metrics.get("best_eval_loss", float('inf'))
+        if start_step > 0:
+            print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
             
-            # Initialize best eval loss from checkpoint metrics or default
-            best_eval_loss = metrics.get("best_eval_loss", float('inf'))
-            if start_step > 0:
-                print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
-            
-            # Create metrics tracker
-            train_metrics = nnx.MultiMetric(
-                total_loss=nnx.metrics.Average('total_loss'),
-                loss=nnx.metrics.Average('loss'),
-                router_loss=nnx.metrics.Average('router_loss'),
-                perplexity=nnx.metrics.Average('perplexity'),
-                accuracy=nnx.metrics.Average('accuracy')
-            )
-            
-            eval_metrics = nnx.MultiMetric(
-                total_loss=nnx.metrics.Average('total_loss'),
-                loss=nnx.metrics.Average('loss'),
-                router_loss=nnx.metrics.Average('router_loss'),
-                perplexity=nnx.metrics.Average('perplexity'),
-                accuracy=nnx.metrics.Average('accuracy')
-            )
+        # Create metrics tracker
+        train_metrics = nnx.MultiMetric(
+            total_loss=nnx.metrics.Average('total_loss'),
+            loss=nnx.metrics.Average('loss'),
+            router_loss=nnx.metrics.Average('router_loss'),
+            perplexity=nnx.metrics.Average('perplexity'),
+            accuracy=nnx.metrics.Average('accuracy')
+        )
+        
+        eval_metrics = nnx.MultiMetric(
+            total_loss=nnx.metrics.Average('total_loss'),
+            loss=nnx.metrics.Average('loss'),
+            router_loss=nnx.metrics.Average('router_loss'),
+            perplexity=nnx.metrics.Average('perplexity'),
+            accuracy=nnx.metrics.Average('accuracy')
+        )
 
-            # Save initial checkpoint at step 0 if no checkpoint exists
-            if start_step == 0:
-                print("Saving initial checkpoint at step 0...")
-                initial_metrics = {
-                    "train": {
-                        "total_loss": 0.0,
-                        "loss": 0.0,
-                        "router_loss": 0.0,
-                        "perplexity": 0.0,
-                        "accuracy": 0.0
-                    },
-                    "eval": {
-                        "total_loss": 0.0,
-                        "loss": 0.0,
-                        "router_loss": 0.0,
-                        "perplexity": 0.0,
-                        "accuracy": 0.0
-                    },
-                    "best_eval_loss": float('inf')
-                }
-                save_checkpoint(
-                    ckpt_manager,
-                    model,
-                    0,
-                    train_loader,
-                    initial_metrics
-                )
+        # test checkpoint save
+        save_checkpoint(model, 0, train_loader, {})
 
-            sync_global_devices("start_training")
-            # Main training loop
-            progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
-            for step in range(start_step, total_steps):
-                batch = train_loader.next()
-                
-                train_step(model, optimizer, train_metrics, batch)
-                progress_bar.update(1)
-                
-                if step  % SAMPLE_STEPS == 0:
-                    print(f"\nSampling text at step {step + 1}:")
-                    generated_text = greedy_sample(model, tokenizer)
-                    print(f"Generated: {generated_text}\n")
-                    if jax.process_index() == 0:
-                        wandb.log({
-                            "generated_text": generated_text,
-                            "step": step
-                        })
-                
-                if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
-                    metrics_values = train_metrics.compute()
-                    train_metrics.reset()
-                    
-                    progress_bar.set_postfix({
-                            'loss': f"{metrics_values['loss']:.4f}",
-                            'ppl': f"{metrics_values['perplexity']:.4f}",
-                            'lr': f"{lr_schedule(step):.6f}"
+        sync_global_devices("start_training")
+        # Main training loop
+        progress_bar = tqdm(total=total_steps - start_step, desc=f"Training")
+        for step in range(start_step, total_steps):
+            batch = train_loader.next()
+            
+            train_step(model, optimizer, train_metrics, batch)
+            progress_bar.update(1)
+            
+            if step  % SAMPLE_STEPS == 0:
+                print(f"\nSampling text at step {step + 1}:")
+                generated_text = greedy_sample(model, tokenizer)
+                print(f"Generated: {generated_text}\n")
+                if jax.process_index() == 0:
+                    wandb.log({
+                        "generated_text": generated_text,
+                        "step": step
                     })
-
-                    if jax.process_index() == 0:
-                        wandb.log({
-                            f"train/{k}": v for k, v in metrics_values.items()
-                        } | {
-                            'train/step': step,
-                            'train/epoch': step / steps_per_epoch
-                        })
+            
+            if (step + 1) % LOG_STEPS == 0 or step == total_steps - 1:
+                metrics_values = train_metrics.compute()
+                train_metrics.reset()
                 
-                # Evaluate and save checkpoint periodically
-                if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
-                    # Evaluate
-                    eval_metrics.reset()
-                    for _ in range(test_loader.steps_per_epoch):
-                        batch = test_loader.next()
-                        eval_step(model, eval_metrics, batch)
-                    
-                    eval_results = eval_metrics.compute()
-                    eval_loss = eval_results['loss']
-                    
-                    # Print eval results
-                    print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
-                          " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
-                    
-                    # Track best model
-                    if eval_loss < best_eval_loss:
-                        best_eval_loss = eval_loss
-                        print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
-                    
-                    if jax.process_index() == 0:
-                        wandb.log({
-                            f"eval/{k}": v for k, v in eval_results.items()
-                        } | {
-                            'eval/step': step,
-                            'eval/epoch': step / steps_per_epoch
-                        })
-                    # Save checkpoint with metrics
-                    metrics = {
-                        "train": metrics_values,
-                        "eval": eval_results,
-                        "best_eval_loss": best_eval_loss
-                    }
+                progress_bar.set_postfix({
+                        'loss': f"{metrics_values['loss']:.4f}",
+                        'ppl': f"{metrics_values['perplexity']:.4f}",
+                        'lr': f"{lr_schedule(step):.6f}"
+                })
 
-                    save_checkpoint(
-                        ckpt_manager, 
-                        model, 
-                        step + 1,  # Save as the next step
-                        train_loader,
-                        metrics
-                    )
-                    
-            progress_bar.close()
-            print("Training complete!")
+                if jax.process_index() == 0:
+                    wandb.log({
+                        f"train/{k}": v for k, v in metrics_values.items()
+                    } | {
+                        'train/step': step,
+                        'train/epoch': step / steps_per_epoch
+                    })
+            
+            # Evaluate and save checkpoint periodically
+            if (step + 1) % EVAL_STEPS == 0 or step == total_steps - 1:
+                # Evaluate
+                eval_metrics.reset()
+                for _ in range(test_loader.steps_per_epoch):
+                    batch = test_loader.next()
+                    eval_step(model, eval_metrics, batch)
+                
+                eval_results = eval_metrics.compute()
+                eval_loss = eval_results['loss']
+                
+                # Print eval results
+                print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
+                        " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
+                
+                # Track best model
+                if eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
+                
+                if jax.process_index() == 0:
+                    wandb.log({
+                        f"eval/{k}": v for k, v in eval_results.items()
+                    } | {
+                        'eval/step': step,
+                        'eval/epoch': step / steps_per_epoch
+                    })
+                # Save checkpoint with metrics
+                metrics = {
+                    "train": metrics_values,
+                    "eval": eval_results,
+                    "best_eval_loss": best_eval_loss
+                }
+
+                save_checkpoint(
+                    model, 
+                    step + 1,  # Save as the next step
+                    train_loader,
+                    metrics
+                )
+                
+        progress_bar.close()
+        print("Training complete!")
 
 if __name__ == "__main__":
     main()
