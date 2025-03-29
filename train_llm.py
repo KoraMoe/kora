@@ -383,21 +383,19 @@ def save_checkpoint(
         "indices": np.array(batch_loader.indices),
     }
     
-    # Use 'with' statement for the checkpoint manager
-    with ckpt_manager:
-        # Save the checkpoint using the new Composite args API
-        ckpt_manager.save(
-            step,
-            args=ocp.args.Composite(
-                model=ocp.args.StandardSave(model_state),
-                optimizer=ocp.args.StandardSave(optimizer_state),
-                batch_state=ocp.args.StandardSave(batch_state),
-                model_stats=ocp.args.JsonSave(metrics or {}),
-            )
+
+    ckpt_manager.save(
+        step,
+        args=ocp.args.Composite(
+            model=ocp.args.StandardSave(model_state),
+            optimizer=ocp.args.StandardSave(optimizer_state),
+            batch_state=ocp.args.StandardSave(batch_state),
+            model_stats=ocp.args.JsonSave(metrics or {}),
         )
+    )
         
-        # Wait for checkpoint to be saved
-        ckpt_manager.wait_until_finished()
+    # Wait for checkpoint to be saved
+    ckpt_manager.wait_until_finished()
     
     print(f"Checkpoint saved at step {step}")
 
@@ -427,16 +425,15 @@ def load_checkpoint(
 
     # Restore checkpoint using the new Composite args API with 'with' statement
     print(f"Restoring checkpoint from step {step}")
-    with ckpt_manager:
-        restored = ckpt_manager.restore(
-            step,
-            args=ocp.args.Composite(
-                model=ocp.args.StandardRestore(abs_model_state),
-                optimizer=ocp.args.StandardRestore(abs_optimizer_state),
-                batch_state=ocp.args.StandardRestore(),
-                model_stats=ocp.args.JsonRestore(),
-            )
+    restored = ckpt_manager.restore(
+        step,
+        args=ocp.args.Composite(
+            model=ocp.args.StandardRestore(abs_model_state),
+            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
+            batch_state=ocp.args.StandardRestore(),
+            model_stats=ocp.args.JsonRestore(),
         )
+    )
     
     # Update model and optimizer states
     nnx.state(model).update(restored["model"])
