@@ -491,6 +491,8 @@ def main():
     options = ocp.CheckpointManagerOptions(
         max_to_keep=5,
         create=True,
+        enable_async_checkpointing=False,
+        single_host_load_and_broadcast=True,
     )
     
     # Define item names for checkpoint
