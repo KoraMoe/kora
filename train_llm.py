@@ -369,9 +369,9 @@ def save_checkpoint(
     model: LLM, 
     step: int,
     batch_loader: BatchLoader,
-    metrics: Optional[Dict[str, Any]] = None
 ) -> None:
     """Save the model, optimizer state, current step, and batch state to checkpoint."""
+    sync_global_devices("start_save_checkpoint")
     # Get states to save
     model_state = nnx.state(model)
 
@@ -439,10 +439,11 @@ def save_checkpoint(
     checkpoint_data = {
         "model_state": local_model_state_dict,
         "batch_state": batch_state,
-        "metrics": metrics or {},
         "step": step
     }
-    
+
+    nnx.display(checkpoint_data)
+
     # Save to a single file using msgpack
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
@@ -451,12 +452,13 @@ def save_checkpoint(
         f.write(msgpack.packb(checkpoint_data, use_bin_type=True))
     
     print(f"Checkpoint saved at step {step} to {checkpoint_path}")
+    sync_global_devices("end_save_checkpoint")
 
 def load_checkpoint(
     mesh: jax.sharding.Mesh,
     model: LLM,
     batch_loader: Optional[BatchLoader] = None
-) -> Tuple[int, Dict[str, Any]]:
+) -> int:
     """Load checkpoint into existing model and optimizer if available using msgpack."""
     # Find the latest checkpoint
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -464,7 +466,7 @@ def load_checkpoint(
     
     if not checkpoint_files:
         print("No checkpoint found, starting from scratch")
-        return 0, {}
+        return 0
     
     # Extract step numbers from filenames and find the latest
     steps = [int(f.split("_")[1].split(".")[0]) for f in checkpoint_files]
@@ -577,7 +579,7 @@ def load_checkpoint(
             batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
             batch_loader._start_producer_thread()
     
-    return latest_step, checkpoint_data.get("metrics", {})
+    return latest_step
 
 def main():
     train_dataset, test_dataset = load_dataset()
@@ -651,13 +653,11 @@ def main():
         sync_global_devices("optimizer_created")
 
         # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(mesh, model, train_loader)
+        start_step = load_checkpoint(mesh, model, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
         
-        # Initialize best eval loss from checkpoint metrics or default
-        best_eval_loss = metrics.get("best_eval_loss", float('inf'))
         if start_step > 0:
-            print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
+            print(f"Process {jax.process_index()}: Resuming from step {start_step}")
             
         # Create metrics tracker
         train_metrics = nnx.MultiMetric(
@@ -675,9 +675,6 @@ def main():
             perplexity=nnx.metrics.Average('perplexity'),
             accuracy=nnx.metrics.Average('accuracy')
         )
-
-        # test checkpoint save
-        save_checkpoint(model, 0, train_loader, {})
 
         sync_global_devices("start_training")
         # Main training loop
@@ -754,7 +751,6 @@ def main():
                     model, 
                     step + 1,  # Save as the next step
                     train_loader,
-                    metrics
                 )
                 
         progress_bar.close()
