@@ -389,7 +389,6 @@ def save_checkpoint(
             model_stats=ocp.args.JsonSave(metrics or {}),
         )
     )
-    ckpt_manager.wait_until_finished()
     
     print(f"Checkpoint saved at step {step}")
 
