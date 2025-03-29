@@ -776,11 +776,7 @@ def main():
                 print(f"\nProcess {jax.process_index()} - Eval at step {step+1}: " + 
                         " ".join([f"{k}={v:.4f}" for k, v in eval_results.items()]))
                 
-                # Track best model
-                if eval_loss < best_eval_loss:
-                    best_eval_loss = eval_loss
-                    print(f"Process {jax.process_index()}: New best eval loss: {best_eval_loss:.4f}")
-                
+
                 if jax.process_index() == 0:
                     wandb.log({
                         f"eval/{k}": v for k, v in eval_results.items()
@@ -788,13 +784,7 @@ def main():
                         'eval/step': step,
                         'eval/epoch': step / steps_per_epoch
                     })
-                # Save checkpoint with metrics
-                metrics = {
-                    "train": metrics_values,
-                    "eval": eval_results,
-                    "best_eval_loss": best_eval_loss
-                }
-
+                
                 save_checkpoint(
                     model, 
                     step + 1,  # Save as the next step
