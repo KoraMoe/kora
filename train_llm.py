@@ -433,6 +433,7 @@ def save_checkpoint(
     print(f"Checkpoint saved at step {step} to {checkpoint_path}")
 
 def load_checkpoint(
+    mesh: jax.sharding.Mesh,
     model: LLM,
     batch_loader: Optional[BatchLoader] = None
 ) -> Tuple[int, Dict[str, Any]]:
@@ -478,24 +479,31 @@ def load_checkpoint(
         else:
             return obj
     
+    # Create abstract model state
+    model_state = nnx.state(model)
+    # Get the named sharding for the model based on the mesh
+    named_sharding = nnx.get_named_sharding(model_state, mesh)
+
     # Process model state
     model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
-    
+
     # Ensure we have a dictionary type for the state
     if not isinstance(model_state_dict, dict):
         raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
-    
-    # Create abstract model state
-    graphdef, abstract_state = nnx.split(model)
-    
+
     # Replace abstract state with restored state
-    nnx.replace_by_pure_dict(abstract_state, model_state_dict)
-    
-    # Merge back to create fully restored model
-    restored_model = nnx.merge(graphdef, abstract_state)
-    
-    # Update the provided model with restored state
-    nnx.update(model, nnx.state(restored_model))
+    nnx.replace_by_pure_dict(model_state, model_state_dict)
+
+    # Apply sharding constraints to the state to ensure it's properly distributed
+    with mesh:
+        # Use jax.device_put with tree_map to apply sharding to each array in the state
+        sharded_state = jax.tree.map(
+            lambda x, s: jax.device_put(x, s) if isinstance(x, jnp.ndarray) else x,
+            model_state, named_sharding
+        )
+        
+        # Update the model with the sharded state
+        nnx.update(model, sharded_state)
     
     # Restore batch loader state if provided
     if batch_loader is not None and "batch_state" in checkpoint_data:
@@ -612,7 +620,7 @@ def main():
         sync_global_devices("optimizer_created")
 
         # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(model, train_loader)
+        start_step, metrics = load_checkpoint(mesh, model, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
         
         # Initialize best eval loss from checkpoint metrics or default
