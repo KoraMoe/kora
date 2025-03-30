@@ -6,32 +6,23 @@ from functools import partial
 @partial(nnx.vmap, in_axes=(0, None, 0, None))
 @partial(nnx.vmap, in_axes=(0, None, None, None))
 def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
-    # Pre-compute causal mask using a more efficient tril operation
+    # Pre-compute causal mask
     if is_causal:
-        # Use tri instead of explicit indices comparison - more efficient for TPU/GPU
         causal_mask = jnp.tril(jnp.ones((seq_len, seq_len), dtype=score_matrix.dtype))
     else:
-        causal_mask = 1.0
+        causal_mask = jnp.ones((seq_len, seq_len), dtype=score_matrix.dtype)
 
-    # Fuse mask creation and application
+    # Combine masks using element-wise multiplication
     if attn_mask is not None:
-        # Combine attention mask and causal mask in one operation
-        # Expand attn_mask dims and convert type in single operation
-        combined_mask = jnp.where(
-            attn_mask[None, :].astype(score_matrix.dtype) * causal_mask > 0,
-            0.0,
-            -1e9
-        )
+        # Expand attention mask dimensions for broadcasting [B, 1, 1, S]
+        attn_mask = attn_mask[:, None, None, :].astype(score_matrix.dtype)
+        combined_mask = causal_mask * attn_mask
     else:
-        # If no attention mask, just use causal mask
-        combined_mask = jnp.where(
-            causal_mask > 0,
-            0.0,
-            -1e9
-        )
-    
-    # Single addition operation instead of log + add
-    return score_matrix + combined_mask
+        combined_mask = causal_mask
+
+    # Apply continuous masking using linear interpolation
+    mask_scale = -(1 - combined_mask) * 1e9  # 0 → 0 penalty, 1 → -1e9 penalty
+    return score_matrix + mask_scale
 
 def orthogonal_init(scale=1.0):
     """Create an orthogonal initializer with the given scale."""
