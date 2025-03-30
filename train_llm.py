@@ -442,8 +442,6 @@ def save_checkpoint(
         "step": step
     }
 
-    nnx.display(checkpoint_data)
-
     # Save to a single file using msgpack
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
