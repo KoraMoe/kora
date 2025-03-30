@@ -974,7 +974,7 @@ class DiffusionLLM(nnx.Module):
         
         return x_t, noise
 
-    def clamp_embed(self, predicted_x_0: jnp.ndarray, temperature: float = 1.0, deterministic: bool = False, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
+    def clamp_embed(self, predicted_x_0: jnp.ndarray, temperature: jnp.ndarray, deterministic: jnp.ndarray, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
         """Quantize predictions to the nearest token embedding.
         
         Args:
@@ -1002,7 +1002,7 @@ class DiffusionLLM(nnx.Module):
             top_indices = jnp.argmax(similarity, axis=-1)
         else:
             # Apply temperature scaling to similarity scores
-            logits = similarity / float(temperature)
+            logits = similarity / temperature
             # Convert to probabilities
             probs = nnx.softmax(logits, axis=-1)
             
@@ -1039,9 +1039,9 @@ class DiffusionLLM(nnx.Module):
         # Determine whether to use stochastic sampling based on timestep
         # Use higher temperature for early timesteps, lower for later ones
         # Timesteps are usually from high to low during sampling
-        timestep_max = float(jnp.max(t))
-        use_deterministic = bool(timestep_max <= 5)  # Use deterministic sampling for final steps
-        temperature = float(jnp.maximum(0.5, timestep_max / 100.0))  # Scale with timestep
+        timestep_max = jnp.max(t)
+        use_deterministic = timestep_max <= 5  # Use deterministic sampling for final steps
+        temperature = jnp.maximum(0.5, timestep_max / 100.0)  # Scale with timestep
         
         # Quantize predicted_x_0 to the nearest token embedding
         predicted_x_0 = self.clamp_embed(
