@@ -511,8 +511,11 @@ def load_checkpoint(
     return 0
 
 @nnx.jit
-def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, rngs: nnx.Rngs, batch):
-    key = rngs.params()
+def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, rngs: nnx.Rngs, batch, 
+               step_count: int = 0, total_steps: int = 100000, 
+               multi_step_prob: float = 0.2, max_denoising_steps: int = 4):
+    key, noise_key, multi_step_key = jax.random.split(rngs.params(), 3)
+    rngs = nnx.Rngs(params=key)
 
     def loss_fn(model: DiffusionLLM):
         input_ids = batch['input_ids']
@@ -520,25 +523,110 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
 
-        t = jax.random.randint(
-            key, 
-            shape=(batch_size, seq_len),
-            minval=0, 
-            maxval=model.timesteps, 
-            dtype=jnp.int32
-        )
-
+        # Progressive learning: start with smaller timestep range and gradually expand
+        # This helps the model learn the final denoising steps first (which are most important)
+        # We expand the range from [T/2, T] initially to [0, T] over the course of training
+        
+        # Calculate the current lower bound for timesteps based on training progress
+        progress = jnp.minimum(1.0, step_count / (total_steps * 0.5))  # 50% of training to reach full range
+        min_t = jnp.maximum(0, model.timesteps // 2 - jnp.floor(progress * model.timesteps // 2).astype(jnp.int32))
+        
         x_0 = model.encode(input_ids)
-        x_t, _ = model.noise(x_0, t, rngs)
-
-        # Model now predicts x_0 directly
-        predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
+        
+        # Decide whether to use single-step or multi-step training for this batch
+        # Start introducing multi-step after 10% of training
+        use_multi_step = jax.random.uniform(multi_step_key) < multi_step_prob * jnp.minimum(1.0, step_count / (total_steps * 0.1))
+        
+        # Determine number of steps for multi-step training (between 2 and max_denoising_steps)
+        num_steps = jnp.where(
+            use_multi_step,
+            jax.random.randint(noise_key, (), 2, max_denoising_steps + 1),
+            1
+        )
+        
+        # Function for single-step training
+        def single_step_training():
+            # Sample timesteps with the current range
+            t = jax.random.randint(
+                noise_key, 
+                shape=(batch_size, seq_len),
+                minval=min_t, 
+                maxval=model.timesteps, 
+                dtype=jnp.int32
+            )
+            
+            # Add noise to reach timestep t
+            x_t, _ = model.noise(x_0, t, rngs)
+            
+            # Predict x_0 directly
+            predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
+            
+            # Return the necessary outputs
+            return predicted_x_0, t, router_loss
+            
+        # Function for multi-step training
+        def multi_step_training():
+            # For multi-step, we need a start and end timestep
+            # We'll sample a span of consecutive timesteps
+            t_max = jax.random.randint(
+                noise_key,
+                shape=(batch_size, seq_len),
+                minval=min_t + num_steps,  # Ensure we have room for multiple steps
+                maxval=model.timesteps,
+                dtype=jnp.int32
+            )
+            
+            # Start with the maximum noise level
+            t = t_max
+            x_t, _ = model.noise(x_0, t, rngs)
+            
+            # Accumulated router loss
+            total_router_loss = jnp.zeros((), dtype=model.dtype)
+            
+            # Perform successive denoising steps
+            for i in range(num_steps - 1):
+                # Denoise one step
+                x_t = model.denoise(x_t, t, rngs, attn_mask=attention_mask)
+                
+                # Update timestep (reduce by 1 at each step)
+                t = jnp.maximum(t - 1, 0)
+                
+            # Final prediction step to get x_0
+            predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
+            total_router_loss += router_loss
+            
+            # Return the final prediction and the last timestep
+            return predicted_x_0, t, total_router_loss
+        
+        # Choose between single-step and multi-step based on the flag
+        predicted_x_0, final_t, router_loss = jax.lax.cond(
+            use_multi_step,
+            multi_step_training,
+            single_step_training
+        )
         
         # Decode predicted x_0 to get logits over vocabulary
         logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
 
-        # loss_mask = (t > 0).astype(logits.dtype) * attention_mask
-        loss_mask = attention_mask
+        # Apply timestep-dependent weighting
+        # Weight function: higher weight for lower timesteps (more important for final quality)
+        # SNR-based weighting: weight proportional to signal-to-noise ratio
+        # This follows the insight that later denoising steps are more critical for final quality
+        # We compute weights based on alpha_cumprod values which represent signal strength
+        t_unsqueezed = final_t[..., None]  # Add feature dimension for broadcasting: [batch, seq, 1]
+        alpha_cumprod_t = jnp.take(model.alphas_cumprod.value, t_unsqueezed).astype(logits.dtype)
+        
+        # SNR = α_t / (1 - α_t)
+        # We use a modified SNR-based weighting that's more stable
+        snr = alpha_cumprod_t / (1.0 - alpha_cumprod_t)
+        
+        # Apply a log scaling and normalization to prevent extreme values
+        # We also add a small constant to give some weight even to the earliest timesteps
+        weights = jnp.log(snr + 1.0) / jnp.log(model.timesteps)
+        weights = weights[..., 0]  # Remove added dimension: [batch, seq]
+        
+        # Combine with attention_mask to ensure we only compute loss on real tokens
+        loss_mask = attention_mask * (0.1 + 0.9 * weights)  # Still give some weight to all timesteps
         
         # Compute cross entropy loss
         # Using standard cross entropy with optional label smoothing
@@ -555,10 +643,10 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
 
         total_loss = masked_loss + jnp.mean(router_loss)
         
-        return total_loss, (masked_loss, router_loss)
+        return total_loss, (masked_loss, router_loss, weights, min_t, num_steps)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (x0_loss, router_loss)), grads = grad_fn(model)
+    (total_loss, (x0_loss, router_loss, timestep_weights, min_t, num_steps)), grads = grad_fn(model)
     
     # Update model parameters
     optimizer.update(grads)
@@ -567,7 +655,11 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
     metrics.update(
         total_loss=total_loss,
         x0_loss=x0_loss,
-        router_loss=router_loss
+        router_loss=router_loss,
+        # Add metrics for progressive learning and multi-step training
+        min_timestep=min_t,
+        avg_timestep_weight=jnp.mean(timestep_weights),
+        denoising_steps=num_steps
     )
 
     return total_loss
@@ -789,7 +881,7 @@ def main():
             batch = train_loader.next()
             rngs = nnx.Rngs(params=jax.random.PRNGKey(step))
 
-            train_step(model, optimizer, train_metrics, rngs, batch)
+            train_step(model, optimizer, train_metrics, rngs, batch, step_count=step, total_steps=total_steps)
             progress_bar.update(1)
             
             if step % SAMPLE_STEPS == 0:

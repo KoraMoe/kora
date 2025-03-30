@@ -974,8 +974,18 @@ class DiffusionLLM(nnx.Module):
         
         return x_t, noise
 
-    def clamp_embed(self, predicted_x_0: jnp.ndarray) -> jnp.ndarray:
-        """Quantize predictions to the nearest token embedding."""
+    def clamp_embed(self, predicted_x_0: jnp.ndarray, temperature: float = 1.0, deterministic: bool = False, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
+        """Quantize predictions to the nearest token embedding.
+        
+        Args:
+            predicted_x_0: Tensor of shape [batch, seq_len, d_model]
+            temperature: Temperature parameter for sampling (higher = more diversity)
+            deterministic: If True, use argmax instead of sampling
+            rngs: Random number generator state
+            
+        Returns:
+            Quantized embeddings aligned with the token embedding space
+        """
         # Find the closest token embedding for each position in predicted_x_0
         # Calculate cosine similarity between predicted_x_0 and all token embeddings
         embeddings = self.text_head.value  # shape: (vocab_size, d_model)
@@ -987,8 +997,24 @@ class DiffusionLLM(nnx.Module):
         # Calculate similarity scores
         similarity = jnp.einsum('btd,vd->btv', predicted_x_0_norm, embeddings_norm)
         
-        # Get the indices of the most similar token embeddings
-        top_indices = jnp.argmax(similarity, axis=-1)
+        if deterministic:
+            # Deterministic selection (argmax)
+            top_indices = jnp.argmax(similarity, axis=-1)
+        else:
+            # Apply temperature scaling to similarity scores
+            logits = similarity / float(temperature)
+            # Convert to probabilities
+            probs = nnx.softmax(logits, axis=-1)
+            
+            # Sample from the probability distribution
+            if rngs is not None:
+                rng_key = rngs.params()
+                # Use categorical sampling (gumbel-max trick is efficient in JAX)
+                gumbel_noise = jax.random.gumbel(rng_key, shape=probs.shape)
+                top_indices = jnp.argmax(jnp.log(probs) + gumbel_noise, axis=-1)
+            else:
+                # Fallback to argmax if no RNG is provided
+                top_indices = jnp.argmax(probs, axis=-1)
         
         # Get the corresponding token embeddings
         quantized_x_0 = self.text_head[top_indices]
@@ -1010,8 +1036,20 @@ class DiffusionLLM(nnx.Module):
         # Now __call__ predicts x_0 directly instead of noise
         predicted_x_0, _ = self.__call__(x_t, t, attn_mask)
 
+        # Determine whether to use stochastic sampling based on timestep
+        # Use higher temperature for early timesteps, lower for later ones
+        # Timesteps are usually from high to low during sampling
+        timestep_max = float(jnp.max(t))
+        use_deterministic = bool(timestep_max <= 5)  # Use deterministic sampling for final steps
+        temperature = float(jnp.maximum(0.5, timestep_max / 100.0))  # Scale with timestep
+        
         # Quantize predicted_x_0 to the nearest token embedding
-        predicted_x_0 = self.clamp_embed(predicted_x_0)
+        predicted_x_0 = self.clamp_embed(
+            predicted_x_0, 
+            temperature=temperature,
+            deterministic=use_deterministic,
+            rngs=rngs
+        )
         
         rng_key = rngs.params()
         
@@ -1031,8 +1069,12 @@ class DiffusionLLM(nnx.Module):
         # Compute posterior variance
         posterior_variance = beta_t * (1.0 - alpha_cumprod_t / alpha_t) / (1.0 - alpha_cumprod_t)
         
+        # Add a small amount of noise even at timestep 0 to increase diversity
+        min_noise_level = 0.001
+        noise_scale = jnp.maximum(min_noise_level, jnp.sqrt(posterior_variance))
+        
         # Sample from posterior
-        x_t_minus_1 = posterior_mean + jnp.sqrt(posterior_variance) * noise
+        x_t_minus_1 = posterior_mean + noise_scale * noise
         
         return x_t_minus_1
 
