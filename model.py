@@ -974,7 +974,7 @@ class DiffusionLLM(nnx.Module):
         
         return x_t, noise
 
-    def clamp_embed(self, predicted_x_0: jnp.ndarray, temperature: jnp.ndarray, deterministic: jnp.ndarray, rngs: nnx.Rngs | None = None) -> jnp.ndarray:
+    def clamp_embed(self, predicted_x_0: jnp.ndarray) -> jnp.ndarray:
         """Quantize predictions to the nearest token embedding.
         
         Args:
@@ -997,24 +997,7 @@ class DiffusionLLM(nnx.Module):
         # Calculate similarity scores
         similarity = jnp.einsum('btd,vd->btv', predicted_x_0_norm, embeddings_norm)
         
-        if deterministic:
-            # Deterministic selection (argmax)
-            top_indices = jnp.argmax(similarity, axis=-1)
-        else:
-            # Apply temperature scaling to similarity scores
-            logits = similarity / temperature
-            # Convert to probabilities
-            probs = nnx.softmax(logits, axis=-1)
-            
-            # Sample from the probability distribution
-            if rngs is not None:
-                rng_key = rngs.params()
-                # Use categorical sampling (gumbel-max trick is efficient in JAX)
-                gumbel_noise = jax.random.gumbel(rng_key, shape=probs.shape)
-                top_indices = jnp.argmax(jnp.log(probs) + gumbel_noise, axis=-1)
-            else:
-                # Fallback to argmax if no RNG is provided
-                top_indices = jnp.argmax(probs, axis=-1)
+        top_indices = jnp.argmax(similarity, axis=-1)
         
         # Get the corresponding token embeddings
         quantized_x_0 = self.text_head[top_indices]
@@ -1036,20 +1019,8 @@ class DiffusionLLM(nnx.Module):
         # Now __call__ predicts x_0 directly instead of noise
         predicted_x_0, _ = self.__call__(x_t, t, attn_mask)
 
-        # Determine whether to use stochastic sampling based on timestep
-        # Use higher temperature for early timesteps, lower for later ones
-        # Timesteps are usually from high to low during sampling
-        timestep_max = jnp.max(t)
-        use_deterministic = timestep_max <= 5  # Use deterministic sampling for final steps
-        temperature = jnp.maximum(0.5, timestep_max / 100.0)  # Scale with timestep
-        
         # Quantize predicted_x_0 to the nearest token embedding
-        predicted_x_0 = self.clamp_embed(
-            predicted_x_0, 
-            temperature=temperature,
-            deterministic=use_deterministic,
-            rngs=rngs
-        )
+        predicted_x_0 = self.clamp_embed(predicted_x_0)
         
         rng_key = rngs.params()
         
