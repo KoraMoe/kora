@@ -18,7 +18,7 @@ import orbax.checkpoint as ocp
 from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 from transformers import AutoTokenizer
-from config import *
+from config_dllm import *
 
 # Import experimental modules explicitly
 import jax.experimental.multihost_utils
@@ -183,7 +183,7 @@ def load_dataset():
     return train_dataset, test_dataset
 
 def make_mesh():
-    mesh = jax.make_mesh((4, 1), ("data", "expert"))
+    mesh = jax.make_mesh(MESH_SHAPE, ("data", "expert"))
     return mesh
 
 @nnx.jit
@@ -311,29 +311,27 @@ def save_checkpoint(
     
     with open(checkpoint_path, "wb") as f:
         packed_data = msgpack.packb(checkpoint_data, use_bin_type=True)
-        f.write(packed_data)
+        f.write(packed_data) # type: ignore
     
     print(f"Checkpoint saved at step {step} to {checkpoint_path}")
     
-    # Maintain only the 5 most recent checkpoints
-    if jax.process_index() == 0:  # Only the main process should clean up old checkpoints
-        try:
-            checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
-            if len(checkpoint_files) > 5:
-                # Extract step numbers from filenames and sort them
-                steps_with_files = [(int(f.split("_")[1].split(".")[0]), f) for f in checkpoint_files]
-                steps_with_files.sort(reverse=True)  # Sort in descending order (newest first)
-                
-                # Keep the 5 most recent checkpoints, delete the rest
-                for _, filename in steps_with_files[5:]:
-                    old_ckpt_path = os.path.join(CHECKPOINT_DIR, filename)
-                    try:
-                        os.remove(old_ckpt_path)
-                        print(f"Removed old checkpoint: {old_ckpt_path}")
-                    except Exception as e:
-                        print(f"Warning: Failed to remove old checkpoint {old_ckpt_path}: {e}")
-        except Exception as e:
-            print(f"Warning: Error during checkpoint cleanup: {e}")
+    try:
+        checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
+        if len(checkpoint_files) > 5:
+            # Extract step numbers from filenames and sort them
+            steps_with_files = [(int(f.split("_")[1].split(".")[0]), f) for f in checkpoint_files]
+            steps_with_files.sort(reverse=True)  # Sort in descending order (newest first)
+            
+            # Keep the 5 most recent checkpoints, delete the rest
+            for _, filename in steps_with_files[5:]:
+                old_ckpt_path = os.path.join(CHECKPOINT_DIR, filename)
+                try:
+                    os.remove(old_ckpt_path)
+                    print(f"Removed old checkpoint: {old_ckpt_path}")
+                except Exception as e:
+                    print(f"Warning: Failed to remove old checkpoint {old_ckpt_path}: {e}")
+    except Exception as e:
+        print(f"Warning: Error during checkpoint cleanup: {e}")
     
     sync_global_devices("end_save_checkpoint")
 
@@ -539,8 +537,8 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         # Decode predicted x_0 to get logits over vocabulary
         logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
 
-        # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
-        loss_mask = (t > 0).astype(jnp.float32) * attention_mask
+        # loss_mask = (t > 0).astype(logits.dtype) * attention_mask
+        loss_mask = attention_mask
         
         # Compute cross entropy loss
         # Using standard cross entropy with optional label smoothing

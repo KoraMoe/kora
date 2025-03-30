@@ -447,7 +447,7 @@ def save_checkpoint(
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
     
     with open(checkpoint_path, "wb") as f:
-        f.write(msgpack.packb(checkpoint_data, use_bin_type=True))
+        f.write(msgpack.packb(checkpoint_data, use_bin_type=True)) # type: ignore
     
     print(f"Checkpoint saved at step {step} to {checkpoint_path}")
     
