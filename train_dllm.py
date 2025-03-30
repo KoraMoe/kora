@@ -6,6 +6,7 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec as PS, NamedSharding as NS
 import queue
 import threading
+import msgpack
 
 from flax import nnx
 import optax
@@ -18,6 +19,9 @@ from typing import Dict, Any, Optional, Tuple
 from jax.experimental.multihost_utils import sync_global_devices
 from transformers import AutoTokenizer
 from config import *
+
+# Import experimental modules explicitly
+import jax.experimental.multihost_utils
 
 class BatchLoader:
     def __init__(self, dataset, batch_size: int, data_spec: NS, seed: int = 42, num_prefetch: int = 6):
@@ -224,121 +228,289 @@ def count_params(model: DiffusionLLM) -> float:
             total += param.size
     return total / 1e9  # Convert to billions
 
-def create_checkpoint_manager(base_dir: str = "checkpoints", max_to_keep: int = 5) -> ocp.CheckpointManager:
-    """Create an Orbax checkpoint manager with the new API style."""
-    os.makedirs(base_dir, exist_ok=True)
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=max_to_keep,
-        create=True,
-        enable_async_checkpointing=True,
-    )
-    # Use the new API style without additional parameters
-    return ocp.CheckpointManager(
-        base_dir,
-        options=options,
-    )
-
 def save_checkpoint(
-    ckpt_manager: ocp.CheckpointManager, 
     model: DiffusionLLM, 
-    optimizer: nnx.Optimizer, 
     step: int,
     batch_loader: BatchLoader,
-    metrics: Optional[Dict[str, Any]] = None
 ) -> None:
-    """Save the model, optimizer state, current step, and batch state to checkpoint using new API."""
+    """Save the model and batch state to checkpoint."""
+    sync_global_devices("start_save_checkpoint")
     # Get states to save
     model_state = nnx.state(model)
-    optimizer_state = nnx.state(optimizer)
+
+    local_model_state = jax.experimental.multihost_utils.process_allgather(model_state)
+
+    local_model_state_dict = local_model_state.to_pure_dict()
+    
+    # Convert JAX and NumPy arrays for msgpack compatibility while preserving metadata
+    def convert_arrays_for_msgpack(obj):
+        if isinstance(obj, jnp.ndarray) or hasattr(obj, "device_buffers"):
+            # For JAX arrays (including sharded arrays), first gather to host
+            try:
+                # For sharded arrays, we need to gather the data to a single device first
+                if hasattr(obj, "is_fully_addressable") and not obj.is_fully_addressable:
+                    # This is a globally distributed array - each process needs its own part
+                    host_array = np.array(jax.device_get(obj))
+                else:
+                    # This is a regular array or fully addressable sharded array
+                    host_array = np.array(obj)
+                    
+                return {
+                    "__jax_array__": True,
+                    "data": host_array.tolist(),
+                    "dtype": str(host_array.dtype),
+                    "shape": host_array.shape
+                }
+            except Exception as e:
+                # Fall back to saving the array information without data
+                # This helps identify the issue while allowing serialization to continue
+                print(f"Warning: Failed to serialize array: {e}")
+                return {
+                    "__jax_array__": True,
+                    "data": None,
+                    "dtype": str(obj.dtype) if hasattr(obj, "dtype") else "unknown",
+                    "shape": obj.shape if hasattr(obj, "shape") else None,
+                    "error": str(e)
+                }
+        elif isinstance(obj, np.ndarray):
+            # For NumPy arrays, save data along with metadata
+            return {
+                "__numpy_array__": True,
+                "data": obj.tolist(),
+                "dtype": str(obj.dtype),
+                "shape": obj.shape
+            }
+        elif isinstance(obj, dict):
+            return {k: convert_arrays_for_msgpack(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_arrays_for_msgpack(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(convert_arrays_for_msgpack(item) for item in obj)
+        else:
+            return obj
+    
+    local_model_state_dict = convert_arrays_for_msgpack(local_model_state_dict)
     
     # Create batch state dict to save batch loader state
     batch_state = {
         "current_epoch": batch_loader.current_epoch,
         "current_idx": batch_loader.current_idx,
-        "indices": np.array(batch_loader.indices),  # Convert to numpy for serialization
+        "indices": convert_arrays_for_msgpack(batch_loader.indices),
     }
     
-    ckpt_manager.save(
-        step, 
-        args=ocp.args.Composite(
-            model=ocp.args.StandardSave(model_state),
-            optimizer=ocp.args.StandardSave(optimizer_state),
-            batch_state=ocp.args.StandardSave(batch_state),
-            model_stats=ocp.args.StandardSave(metrics or {})
-        )
-    )
-    ckpt_manager.wait_until_finished()
-    print(f"Checkpoint saved at step {step}")
+    # Combine all data into a single dictionary
+    checkpoint_data = {
+        "model_state": local_model_state_dict,
+        "batch_state": batch_state,
+        "step": step
+    }
+
+    # Save to a single file using msgpack
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
+    
+    with open(checkpoint_path, "wb") as f:
+        packed_data = msgpack.packb(checkpoint_data, use_bin_type=True)
+        f.write(packed_data)
+    
+    print(f"Checkpoint saved at step {step} to {checkpoint_path}")
+    
+    # Maintain only the 5 most recent checkpoints
+    if jax.process_index() == 0:  # Only the main process should clean up old checkpoints
+        try:
+            checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
+            if len(checkpoint_files) > 5:
+                # Extract step numbers from filenames and sort them
+                steps_with_files = [(int(f.split("_")[1].split(".")[0]), f) for f in checkpoint_files]
+                steps_with_files.sort(reverse=True)  # Sort in descending order (newest first)
+                
+                # Keep the 5 most recent checkpoints, delete the rest
+                for _, filename in steps_with_files[5:]:
+                    old_ckpt_path = os.path.join(CHECKPOINT_DIR, filename)
+                    try:
+                        os.remove(old_ckpt_path)
+                        print(f"Removed old checkpoint: {old_ckpt_path}")
+                    except Exception as e:
+                        print(f"Warning: Failed to remove old checkpoint {old_ckpt_path}: {e}")
+        except Exception as e:
+            print(f"Warning: Error during checkpoint cleanup: {e}")
+    
+    sync_global_devices("end_save_checkpoint")
 
 def load_checkpoint(
-    ckpt_manager: ocp.CheckpointManager,
+    mesh: jax.sharding.Mesh,
     model: DiffusionLLM,
-    optimizer: nnx.Optimizer,
     batch_loader: Optional[BatchLoader] = None
-) -> Tuple[int, Dict[str, Any]]:
-    """Load checkpoint into existing model and optimizer if available using new API."""
-    # Check if checkpoint exists
-    step = ckpt_manager.latest_step()
-    if step is None:
+) -> int:
+    """Load checkpoint into existing model if available using msgpack."""
+    # Find the latest checkpoint
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    checkpoint_files = [f for f in os.listdir(CHECKPOINT_DIR) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
+    
+    if not checkpoint_files:
         print("No checkpoint found, starting from scratch")
-        return 0, {}
+        return 0
     
-    # Create abstract target based on the existing model and optimizer
-    abs_model_state = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
-        nnx.state(model)
-    )
+    # Extract step numbers from filenames and find the latest
+    steps = [int(f.split("_")[1].split(".")[0]) for f in checkpoint_files]
+    steps.sort(reverse=True)  # Sort in descending order to try newest first
     
-    abs_optimizer_state = jax.tree.map(
-        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding) if hasattr(x, 'shape') else x,
-        nnx.state(optimizer)
-    )
-
-    # Restore checkpoint
-    print(f"Restoring checkpoint from step {step}")
-    restored = ckpt_manager.restore(
-        step, 
-        args=ocp.args.Composite(
-            model=ocp.args.StandardRestore(abs_model_state),
-            optimizer=ocp.args.StandardRestore(abs_optimizer_state),
-            batch_state=ocp.args.StandardRestore(),
-            model_stats=ocp.args.StandardRestore()
-        )
-    )
-    
-    # Update model and optimizer states
-    nnx.state(model).update(restored["model"])
-    nnx.state(optimizer).update(restored["optimizer"])
-    
-    # Restore batch loader state if provided
-    if batch_loader is not None:
+    # Try to load checkpoints starting from the newest, fallback to older ones if needed
+    for step in steps:
+        checkpoint_path = os.path.join(CHECKPOINT_DIR, f"checkpoint_{step}.msgpack")
+        print(f"Attempting to load checkpoint from {checkpoint_path}")
+        
         try:
-            batch_state = restored["batch_state"]
-            batch_loader.current_epoch = batch_state["current_epoch"]
-            batch_loader.current_idx = batch_state["current_idx"]
+            # Load checkpoint data using msgpack
+            with open(checkpoint_path, "rb") as f:
+                try:
+                    checkpoint_data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
+                except (ValueError, msgpack.exceptions.UnpackException) as e:
+                    print(f"Failed to unpack checkpoint {checkpoint_path}: {str(e)}")
+                    # Delete the corrupted checkpoint file
+                    print(f"Deleting corrupted checkpoint file: {checkpoint_path}")
+                    try:
+                        os.remove(checkpoint_path)
+                    except Exception as delete_error:
+                        print(f"Warning: Could not delete corrupted checkpoint: {delete_error}")
+                    continue  # Try the next checkpoint
             
-            # Handle potential issues with indices
-            indices = batch_state["indices"]
-            if len(indices) > 0:
-                # Ensure indices are within the valid range for the dataset
-                indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
-                batch_loader.indices = indices
-            else:
-                batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+            # Convert structured arrays back to appropriate types
+            def convert_from_msgpack(obj):
+                if isinstance(obj, dict):
+                    # Check if this is a serialized array
+                    if "__jax_array__" in obj:
+                        # Handle the case where array data might be None due to serialization issues
+                        if obj["data"] is None:
+                            print(f"Warning: Found array with missing data. Error: {obj.get('error', 'Unknown')}")
+                            # Create an empty array with the right shape and dtype if possible
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                # If we don't have shape info, return a scalar zero
+                                return jnp.array(0, dtype=dtype_str)
+                        # Normal case - convert back to JAX array
+                        try:
+                            array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                            return jnp.array(array_data)
+                        except Exception as array_error:
+                            print(f"Error converting array: {array_error}")
+                            # Fallback to zeros with appropriate shape
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                return jnp.array(0, dtype=dtype_str)
+                    elif "__numpy_array__" in obj:
+                        # Convert back to NumPy array
+                        try:
+                            return np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                        except Exception as np_error:
+                            print(f"Error converting numpy array: {np_error}")
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return np.zeros(shape, dtype=dtype_str)
+                            else:
+                                return np.array(0, dtype=dtype_str)
+                    else:
+                        # Regular dictionary
+                        return {k: convert_from_msgpack(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_from_msgpack(item) for item in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(convert_from_msgpack(item) for item in obj)
+                else:
+                    return obj
             
-            # Restart the batch loader thread with new state
-            batch_loader._start_producer_thread()
-            
+            try:
+                # Create abstract model state
+                model_state = nnx.state(model)
+                # Get the named sharding for the model based on the mesh
+                named_sharding = nnx.get_named_sharding(model_state, mesh)
+
+                # Process model state
+                model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
+
+                # Ensure we have a dictionary type for the state
+                if not isinstance(model_state_dict, dict):
+                    raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
+
+                # Replace abstract state with restored state
+                nnx.replace_by_pure_dict(model_state, model_state_dict)
+
+                # Apply sharding constraints to the state to ensure it's properly distributed
+                with mesh:
+                    # Use jax.device_put with tree_map to apply sharding to each array in the state
+                    sharded_state = jax.tree.map(
+                        lambda x, s: jax.device_put(x, s) if isinstance(x, jnp.ndarray) else x,
+                        model_state, named_sharding
+                    )
+                    
+                    # Update the model with the sharded state
+                    nnx.update(model, sharded_state)
+                
+                # Restore batch loader state if provided
+                if batch_loader is not None and "batch_state" in checkpoint_data:
+                    try:
+                        batch_state = checkpoint_data["batch_state"]
+                        batch_loader.current_epoch = batch_state["current_epoch"]
+                        batch_loader.current_idx = batch_state["current_idx"]
+                        
+                        # Handle indices - should already be converted from msgpack
+                        indices_data = convert_from_msgpack(batch_state["indices"])
+                        
+                        # Ensure indices is a NumPy array
+                        if not isinstance(indices_data, np.ndarray):
+                            # Convert to numpy array if it's not already
+                            if hasattr(indices_data, "__len__"):
+                                indices = np.array(indices_data, dtype=np.int64)
+                            else:
+                                # Fallback to creating new indices
+                                print("Warning: Invalid indices data in checkpoint, regenerating")
+                                indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples).astype(np.int64)
+                        else:
+                            # Ensure the right dtype
+                            indices = indices_data.astype(np.int64)
+                        
+                        if len(indices) > 0:
+                            # Ensure indices are within the valid range for the dataset
+                            indices = np.clip(indices, 0, len(batch_loader.dataset) - 1)
+                            batch_loader.indices = indices
+                        else:
+                            batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+                        
+                        # Restart the batch loader thread with new state
+                        batch_loader._start_producer_thread()
+                        
+                    except Exception as e:
+                        print(f"Warning: Failed to restore batch loader state: {str(e)}")
+                        print("Reinitializing batch loader...")
+                        # Reset the batch loader to initial state
+                        batch_loader.current_epoch = 0
+                        batch_loader.current_idx = 0
+                        batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
+                        batch_loader._start_producer_thread()
+                
+                print(f"Successfully loaded checkpoint from step {step}")
+                return step
+                
+            except Exception as e:
+                print(f"Error processing checkpoint {checkpoint_path}: {str(e)}")
+                print("Trying an older checkpoint...")
+                continue
+                
         except Exception as e:
-            print(f"Warning: Failed to restore batch loader state: {str(e)}")
-            print("Reinitializing batch loader...")
-            # Reset the batch loader to initial state
-            batch_loader.current_epoch = 0
-            batch_loader.current_idx = 0
-            batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
-            batch_loader._start_producer_thread()
+            print(f"Error opening checkpoint file {checkpoint_path}: {str(e)}")
+            print("Trying an older checkpoint...")
+            continue
     
-    return step, restored.get("model_stats", {})
+    # If we've reached here, all checkpoints failed to load
+    print("All checkpoints failed to load. Starting from scratch.")
+    return 0
 
 @nnx.jit
 def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, rngs: nnx.Rngs, batch):
@@ -551,9 +723,6 @@ def main():
     print(f"Process {jax.process_index()}: Created data loaders")
     sync_global_devices("data_loaders_created")
 
-    # Create checkpoint manager
-    ckpt_manager = create_checkpoint_manager(CHECKPOINT_DIR)
-    
     # Calculate training steps
     num_epochs = NUM_EPOCHS
     steps_per_epoch = train_loader.steps_per_epoch
@@ -594,14 +763,14 @@ def main():
         sync_global_devices("optimizer_created")
         
         # Try to restore from checkpoint
-        start_step, metrics = load_checkpoint(ckpt_manager, model, optimizer, train_loader)
+        start_step = load_checkpoint(mesh, model, train_loader)
         print(f"Process {jax.process_index()}: Restored checkpoint state")
         sync_global_devices("checkpoint_restored")
         
-        # Initialize best eval loss from checkpoint metrics or default
-        best_eval_loss = metrics.get("best_eval_loss", float('inf'))
+        # Initialize best eval loss from previous run or default
+        best_eval_loss = float('inf')
         if start_step > 0:
-            print(f"Process {jax.process_index()}: Resuming from step {start_step} with best eval loss: {best_eval_loss:.4f}")
+            print(f"Process {jax.process_index()}: Resuming from step {start_step}")
         
         # Create metrics tracker
         train_metrics = nnx.MultiMetric(
@@ -681,19 +850,11 @@ def main():
                         'eval/epoch': step / steps_per_epoch
                     })
                 
-                # Save checkpoint with metrics
-                metrics = {
-                    "train": metrics_values,
-                    "eval": eval_results,
-                    "best_eval_loss": best_eval_loss
-                }
+                # Save checkpoint
                 save_checkpoint(
-                    ckpt_manager, 
                     model, 
-                    optimizer, 
                     step + 1,
                     train_loader,
-                    metrics
                 )
                 
         progress_bar.close()
