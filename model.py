@@ -974,6 +974,27 @@ class DiffusionLLM(nnx.Module):
         
         return x_t, noise
 
+    def clamp_embed(self, predicted_x_0: jnp.ndarray) -> jnp.ndarray:
+        """Quantize predictions to the nearest token embedding."""
+        # Find the closest token embedding for each position in predicted_x_0
+        # Calculate cosine similarity between predicted_x_0 and all token embeddings
+        embeddings = self.text_head.value  # shape: (vocab_size, d_model)
+        
+        # Normalize embeddings and predicted_x_0 for cosine similarity
+        embeddings_norm = embeddings / jnp.linalg.norm(embeddings, axis=1, keepdims=True)
+        predicted_x_0_norm = predicted_x_0 / jnp.linalg.norm(predicted_x_0, axis=-1, keepdims=True)
+        
+        # Calculate similarity scores
+        similarity = jnp.einsum('btd,vd->btv', predicted_x_0_norm, embeddings_norm)
+        
+        # Get the indices of the most similar token embeddings
+        top_indices = jnp.argmax(similarity, axis=-1)
+        
+        # Get the corresponding token embeddings
+        quantized_x_0 = self.text_head[top_indices]
+        
+        return quantized_x_0
+
     def denoise(self, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
         # x_t shape: (batch_size, seq_len, d_model)
         # t shape: (batch_size, seq_len)
@@ -988,6 +1009,9 @@ class DiffusionLLM(nnx.Module):
         
         # Now __call__ predicts x_0 directly instead of noise
         predicted_x_0, _ = self.__call__(x_t, t, attn_mask)
+
+        # Quantize predicted_x_0 to the nearest token embedding
+        predicted_x_0 = self.clamp_embed(predicted_x_0)
         
         rng_key = rngs.params()
         
