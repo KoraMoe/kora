@@ -942,7 +942,7 @@ class DiffusionLLM(nnx.Module):
         self.sqrt_one_minus_alphas_cumprod = nnx.Variable(jnp.sqrt(1.0 - self.alphas_cumprod.value))
     
     def encode(self, input_ids: jnp.ndarray) -> jnp.ndarray:
-        return self.text_head[input_ids]
+        return self.text_head.value[input_ids]
 
     def decode(self, x: jnp.ndarray) -> jnp.ndarray:
         return jnp.einsum('btd,vd->btv', x, self.text_head.value)
