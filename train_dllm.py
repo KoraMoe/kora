@@ -618,15 +618,15 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
 
 def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0)):
     @nnx.jit
-    def encode_input(model, input_ids):
+    def encode_input(model: DiffusionLLM, input_ids: jnp.ndarray):
         return model.encode(input_ids)
 
     @nnx.jit
-    def add_noise(model, x, t, rngs):
+    def add_noise(model: DiffusionLLM, x: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs):
         return model.noise(x, t, rngs)
 
     @nnx.jit
-    def denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0):
+    def denoise_step(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, x_0: jnp.ndarray):
         # Denoise
         # Add extra dimension to attention_mask to match expected shape
         attention_mask = attention_mask[..., None]  # Shape becomes (batch, seq_len, 1)
@@ -635,7 +635,7 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
         return jnp.where(prompt_mask[..., None], x_0, new_x)
 
     @nnx.jit
-    def decode_output(model, x_t):
+    def decode_output(model: DiffusionLLM, x_t: jnp.ndarray):
         logits = model.decode(x_t)
         return jnp.argmax(logits, axis=-1)
 
