@@ -558,12 +558,14 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         weighted_loss = loss_mask * timestep_weights * per_token_loss
         masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
 
-        total_loss = masked_loss + jnp.mean(router_loss)
+        mse_loss = jnp.mean((x_0 - predicted_x_0) ** 2)
+
+        total_loss = masked_loss + jnp.mean(router_loss) + mse_loss * 0.1
         
-        return total_loss, (masked_loss, router_loss)
+        return total_loss, (masked_loss, router_loss, mse_loss)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (x0_loss, router_loss)), grads = grad_fn(model)
+    (total_loss, (x0_loss, router_loss, mse_loss)), grads = grad_fn(model)
     
     # Update model parameters
     optimizer.update(grads)
@@ -572,7 +574,8 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
     metrics.update(
         total_loss=total_loss,
         x0_loss=x0_loss,
-        router_loss=router_loss
+        router_loss=router_loss,
+        mse_loss=mse_loss
     )
 
     return total_loss
@@ -793,7 +796,8 @@ def main():
         train_metrics = nnx.MultiMetric(
             total_loss=nnx.metrics.Average('total_loss'),
             x0_loss=nnx.metrics.Average('x0_loss'),
-            router_loss=nnx.metrics.Average('router_loss')
+            router_loss=nnx.metrics.Average('router_loss'),
+            mse_loss=nnx.metrics.Average('mse_loss')
         )
         
         eval_metrics = nnx.MultiMetric(

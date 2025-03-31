@@ -4,7 +4,7 @@ import os
 CONTEXT_LENGTH = 512
 BATCH_SIZE = 128
 NUM_EPOCHS = 10
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 5e-5
 WARMUP_STEPS = 500
 GRADIENT_CLIP_NORM = 1.0
 DTYPE = jnp.bfloat16
@@ -13,7 +13,7 @@ TOKENIZED_DATASET_PATH = "/mnt/data/tokenized_dataset"
 TOKENIZER_NAME = "gpt2"
 CHECKPOINT_DIR = os.path.join(os.path.expanduser("~"), "checkpoints")
 LOG_STEPS = 50
-EVAL_STEPS = 500
+EVAL_STEPS = 5000
 SAMPLE_STEPS = 500
 MESH_SHAPE = (4, 1)  # (data, expert)
 
