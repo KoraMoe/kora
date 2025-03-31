@@ -537,8 +537,14 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         # Decode predicted x_0 to get logits over vocabulary
         logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
 
-        # loss_mask = (t > 0).astype(logits.dtype) * attention_mask
-        loss_mask = attention_mask
+        # Create a mask for timesteps > 0 and valid tokens
+        loss_mask = (t > 0).astype(logits.dtype) * attention_mask
+        
+        # Create timestep-based weights (higher weight for later timesteps)
+        # Normalize t to range [0, 1] then apply weighting function
+        t_normalized = t.astype(logits.dtype) / model.timesteps
+        # Apply weighting: higher weight for later timesteps (closer to pure noise)
+        timestep_weights = 1.0 + 2.0 * t_normalized  # Linear weighting from 1.0 to 3.0
         
         # Compute cross entropy loss
         # Using standard cross entropy with optional label smoothing
@@ -548,10 +554,9 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
             axis=-1
         )
         
-        # Apply loss mask and compute mean loss
-        masked_loss = jnp.sum(
-            loss_mask * per_token_loss
-        ) / (jnp.sum(loss_mask) + 1e-8)
+        # Apply loss mask and timestep weights, then compute mean loss
+        weighted_loss = loss_mask * timestep_weights * per_token_loss
+        masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
 
         total_loss = masked_loss + jnp.mean(router_loss)
         
@@ -591,28 +596,42 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         )
 
         x_0 = model.encode(input_ids)
-        x_t, noise = model.noise(x_0, t, rngs)
+        x_t, _ = model.noise(x_0, t, rngs)
 
-        predicted_noise, router_loss = model(x_t, t, attn_mask=attention_mask)
-
+        # Model now predicts x_0 directly, matching training
+        predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
+        
+        # Decode predicted x_0 to get logits over vocabulary
+        logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
+        
         # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
-        loss_mask = (t > 0).astype(predicted_noise.dtype)[..., None] * attention_mask[..., None]
+        loss_mask = (t > 0).astype(logits.dtype) * attention_mask
         
-        # Only compute loss for non-zero timesteps and valid tokens
-        noise_loss = jnp.sum(
-            loss_mask * ((predicted_noise - noise) ** 2)
-        ) / (jnp.sum(loss_mask) + 1e-8)  # Add small epsilon to avoid division by zero
+        # Apply timestep-based weighting
+        t_normalized = t.astype(logits.dtype) / model.timesteps
+        timestep_weights = 1.0 + 2.0 * t_normalized  # Linear weighting from 1.0 to 3.0
+        
+        # Compute cross entropy loss using one-hot labels
+        labels = nnx.one_hot(input_ids, num_classes=logits.shape[-1])
+        per_token_loss = -jnp.sum(
+            labels * nnx.log_softmax(logits),
+            axis=-1
+        )
+        
+        # Apply loss mask and compute weighted mean loss
+        weighted_loss = loss_mask * timestep_weights * per_token_loss
+        masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
 
-        total_loss = noise_loss + jnp.mean(router_loss)
+        total_loss = masked_loss + jnp.mean(router_loss)
         
-        return total_loss, (noise_loss, router_loss)
+        return total_loss, (masked_loss, router_loss)
     
-    total_loss, (noise_loss, router_loss) = loss_fn(model)
+    total_loss, (x0_loss, router_loss) = loss_fn(model)
     
     # Update metrics
     metrics.update(
         total_loss=total_loss,
-        noise_loss=noise_loss,
+        x0_loss=x0_loss,
         router_loss=router_loss
     )
 
@@ -779,7 +798,7 @@ def main():
         
         eval_metrics = nnx.MultiMetric(
             total_loss=nnx.metrics.Average('total_loss'),
-            noise_loss=nnx.metrics.Average('noise_loss'),
+            x0_loss=nnx.metrics.Average('x0_loss'),
             router_loss=nnx.metrics.Average('router_loss')
         )
 

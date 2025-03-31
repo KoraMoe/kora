@@ -1044,9 +1044,8 @@ class DiffusionLLM(nnx.Module):
         # attn_mask shape: (batch, seq_len) - 1 for real tokens, 0 for padding
         
         # Linear interpolation from 1 to 0 based on timestep
-        # t_ratio = t.astype(self.dtype) / self.timesteps
-        # dynamic_mask = (1.0 - t_ratio) * (attn_mask if attn_mask is not None else 1.0)
-        dynamic_mask = attn_mask
+        t_ratio = t.astype(self.dtype) / self.timesteps
+        dynamic_mask = (1.0 - t_ratio) * (attn_mask if attn_mask is not None else 1.0)
         
         router_loss = jnp.zeros((), dtype=self.dtype)
         for i, block in enumerate(self.blocks):
