@@ -4,7 +4,6 @@ from flax import nnx
 from functools import partial
 
 @partial(nnx.vmap, in_axes=(0, None, 0, None))
-@partial(nnx.vmap, in_axes=(0, None, None, None))
 def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray | None = None, is_causal: bool = True) -> jnp.ndarray:
     # Pre-compute causal mask
     if is_causal:
@@ -14,8 +13,7 @@ def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray 
 
     # Combine masks using element-wise multiplication
     if attn_mask is not None:
-        # Expand attention mask dimensions for broadcasting [B, 1, 1, S]
-        attn_mask = attn_mask[:, None, None, :].astype(score_matrix.dtype)
+        attn_mask = attn_mask.reshape(1, seq_len).astype(score_matrix.dtype)
         combined_mask = causal_mask * attn_mask
     else:
         combined_mask = causal_mask
