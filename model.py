@@ -18,6 +18,9 @@ def _apply_mask(score_matrix: jnp.ndarray, seq_len: int, attn_mask: jnp.ndarray 
     else:
         combined_mask = causal_mask
 
+    # Add self-attention by setting diagonal to 1
+    combined_mask = combined_mask.at[jnp.diag_indices(seq_len)].set(1.0)
+
     # Apply continuous masking using linear interpolation
     mask_scale = -(1 - combined_mask) * 1e9  # 0 → 0 penalty, 1 → -1e9 penalty
     return score_matrix + mask_scale
