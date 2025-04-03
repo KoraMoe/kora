@@ -1114,7 +1114,11 @@ class DiffusionLLM(nnx.Module):
         
         # Add timestep embedding to the input
         # Get timestep embeddings for each position
-        t_emb = self.timestep_embedding.value[t]
+        t_emb = self.timestep_embedding.value[t]  # This might have shape (batch, seq_len, 1, d_model)
+        
+        # Ensure t_emb has shape (batch, seq_len, d_model)
+        if t_emb.ndim == 4:
+            t_emb = t_emb.squeeze(axis=2)
         
         # Add timestep embedding to the input
         x = x + t_emb
