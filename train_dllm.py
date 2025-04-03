@@ -656,7 +656,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         router_loss=router_loss
     )
 
-def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20):
+def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = False, ddim_steps: int = 20):
     @nnx.jit
     def encode_input(model: DiffusionLLM, input_ids: jnp.ndarray):
         return model.encode(input_ids)
