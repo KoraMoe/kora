@@ -560,16 +560,13 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         weighted_loss = loss_mask * timestep_weights * per_token_loss
         masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
 
-        # Compute MSE loss with proper scaling
-        mse_loss = jnp.mean((x_0 - predicted_x_0) ** 2) * jnp.sqrt(model.d_model)
-
         # Balance the losses
-        total_loss = masked_loss + jnp.mean(router_loss) + 0.5 * mse_loss
+        total_loss = masked_loss + jnp.mean(router_loss)
         
-        return total_loss, (masked_loss, router_loss, mse_loss)
+        return total_loss, (masked_loss, router_loss)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (x0_loss, router_loss, mse_loss)), grads = grad_fn(model)
+    (total_loss, (x0_loss, router_loss)), grads = grad_fn(model)
     
     # Update model parameters
     optimizer.update(grads)
@@ -579,7 +576,6 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         total_loss=total_loss,
         x0_loss=x0_loss,
         router_loss=router_loss,
-        mse_loss=mse_loss
     )
 
     return total_loss
@@ -642,7 +638,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         router_loss=router_loss
     )
 
-def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0)):
+def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20):
     @nnx.jit
     def encode_input(model: DiffusionLLM, input_ids: jnp.ndarray):
         return model.encode(input_ids)
@@ -654,9 +650,16 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     @nnx.jit
     def denoise_step(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, x_0: jnp.ndarray):
         # Denoise
-        # Add extra dimension to attention_mask to match expected shape
-        attention_mask = attention_mask[..., None]  # Shape becomes (batch, seq_len, 1)
-        new_x = model.denoise(x_t, t, rngs, attention_mask)
+        # The attention_mask should have shape (batch, seq_len) for the model's __call__ method
+        # No need to add an extra dimension
+        new_x = model.denoise_ddim(x_t, t, attn_mask=attention_mask)
+        # Keep prompt tokens unchanged
+        return jnp.where(prompt_mask[..., None], x_0, new_x)
+
+    @nnx.jit
+    def denoise_step_standard(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, x_0: jnp.ndarray):
+        # Standard denoising with stochastic sampling
+        new_x = model.denoise(x_t, t, rngs, attn_mask=attention_mask)
         # Keep prompt tokens unchanged
         return jnp.where(prompt_mask[..., None], x_0, new_x)
 
@@ -699,15 +702,34 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     # Only use noise for non-prompt positions
     x_t = jnp.where(prompt_mask[..., None], x_0, x_t)
     
-    # Denoise step by step
-    for timestep in range(model.timesteps - 1, -1, -1):
-        # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
-        t = jnp.where(
-            prompt_mask,
-            jnp.zeros_like(input_ids),
-            jnp.full_like(input_ids, timestep)
-        )
-        x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
+    # Choose denoising approach
+    if use_ddim:
+        # DDIM sampling with fewer steps
+        # Calculate step size for DDIM
+        step_size = model.timesteps // ddim_steps
+        
+        # Denoise step by step with DDIM
+        for i in range(ddim_steps - 1, -1, -1):
+            # Calculate current timestep
+            current_t = i * step_size
+            
+            # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
+            t = jnp.where(
+                prompt_mask,
+                jnp.zeros_like(input_ids),
+                jnp.full_like(input_ids, current_t)
+            )
+            x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
+    else:
+        # Standard denoising with all timesteps
+        for timestep in range(model.timesteps - 1, -1, -1):
+            # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
+            t = jnp.where(
+                prompt_mask,
+                jnp.zeros_like(input_ids),
+                jnp.full_like(input_ids, timestep)
+            )
+            x_t = denoise_step_standard(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
     
     # Decode to tokens
     generated_ids = decode_output(model, x_t)
@@ -801,7 +823,6 @@ def main():
             total_loss=nnx.metrics.Average('total_loss'),
             x0_loss=nnx.metrics.Average('x0_loss'),
             router_loss=nnx.metrics.Average('router_loss'),
-            mse_loss=nnx.metrics.Average('mse_loss')
         )
         
         eval_metrics = nnx.MultiMetric(
