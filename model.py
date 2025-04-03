@@ -1131,6 +1131,10 @@ class DiffusionLLM(nnx.Module):
             # Use a more gradual decay function that preserves attention longer
             decay = 1.0 - jnp.tanh(2.0 * t_ratio)  # Slower falloff at the beginning
             
+            # Ensure decay has shape (batch, seq_len)
+            if decay.ndim == 3:
+                decay = decay.squeeze(axis=2)
+            
             # Apply non-linear mask scaling - ensure shapes are compatible for broadcasting
             # attn_mask: (batch, seq_len)
             # decay: (batch, seq_len)
