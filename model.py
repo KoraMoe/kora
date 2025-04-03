@@ -935,9 +935,25 @@ class DiffusionLLM(nnx.Module):
         
         self.final_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
 
-        # Build noise schedule
-        self.betas = nnx.Variable(jnp.linspace(beta_start, beta_end, timesteps))
-        self.alphas = nnx.Variable(1.0 - self.betas)
+        # Build noise schedule - cosine schedule instead of linear
+        # Function to create cosine schedule following Improved DDPM paper
+        def cosine_beta_schedule(timesteps, s=0.008):
+            """
+            Create a beta schedule that follows a cosine curve.
+            As proposed in https://arxiv.org/abs/2102.09672
+            """
+            steps = timesteps + 1
+            x = jnp.linspace(0, timesteps, steps)
+            alphas_cumprod = jnp.cos(((x / timesteps) + s) / (1 + s) * jnp.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            
+            # Clip to prevent numerical issues
+            betas = jnp.clip(betas, 0, 0.999)
+            return betas
+
+        self.betas = nnx.Variable(cosine_beta_schedule(timesteps))
+        self.alphas = nnx.Variable(1.0 - self.betas.value)
         self.alphas_cumprod = nnx.Variable(jnp.cumprod(self.alphas.value))
         self.sqrt_alphas_cumprod = nnx.Variable(jnp.sqrt(self.alphas_cumprod.value))
         self.sqrt_one_minus_alphas_cumprod = nnx.Variable(jnp.sqrt(1.0 - self.alphas_cumprod.value))
@@ -972,7 +988,6 @@ class DiffusionLLM(nnx.Module):
         Args:
             predicted_x_0: Tensor of shape [batch, seq_len, d_model]
             temperature: Temperature parameter for sampling (higher = more diversity)
-            deterministic: If True, use argmax instead of sampling
             rngs: Random number generator state
             
         Returns:
@@ -1046,9 +1061,18 @@ class DiffusionLLM(nnx.Module):
         # t shape: (batch, seq_len)
         # attn_mask shape: (batch, seq_len) - 1 for real tokens, 0 for padding
         
-        # Linear interpolation from 1 to 0 based on timestep
-        t_ratio = t.astype(self.dtype) / self.timesteps
-        dynamic_mask = (1.0 - t_ratio) * (attn_mask if attn_mask is not None else 1.0)
+        # Non-linear interpolation from 1.0 to 0.0 based on timestep
+        # Use a sigmoid-based interpolation for more gradual attention reduction
+        if attn_mask is not None:
+            t_ratio = t.astype(self.dtype) / self.timesteps
+            
+            # Use a more gradual decay function that preserves attention longer
+            decay = 1.0 - jnp.tanh(2.0 * t_ratio)  # Slower falloff at the beginning
+            
+            # Apply non-linear mask scaling
+            dynamic_mask = attn_mask * decay[..., None]
+        else:
+            dynamic_mask = None
         
         router_loss = jnp.zeros((), dtype=self.dtype)
         for i, block in enumerate(self.blocks):

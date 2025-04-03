@@ -537,18 +537,20 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         # Decode predicted x_0 to get logits over vocabulary
         logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
 
-        # Create a mask for timesteps > 0 and valid tokens
-        loss_mask = (t > 0).astype(logits.dtype) * attention_mask
+        # Create a mask for valid tokens
+        loss_mask = attention_mask
         
-        # Create timestep-based weights (higher weight for later timesteps)
-        # Normalize t to range [0, 1] then apply weighting function
+        # Create timestep-based weights (more balanced weighting)
         t_normalized = t.astype(logits.dtype) / model.timesteps
-        # Apply weighting: higher weight for later timesteps (closer to pure noise)
-        timestep_weights = 1.0 + 2.0 * t_normalized  # Linear weighting from 1.0 to 3.0
+        # Use a smoother weighting function that doesn't over-emphasize later timesteps
+        timestep_weights = 1.0 + t_normalized  # Linear weighting from 1.0 to 2.0
         
-        # Compute cross entropy loss
-        # Using standard cross entropy with optional label smoothing
+        # Compute cross entropy loss with label smoothing
         labels = nnx.one_hot(input_ids, num_classes=logits.shape[-1])
+        # Add label smoothing
+        label_smoothing = 0.1
+        labels = (1.0 - label_smoothing) * labels + label_smoothing / labels.shape[-1]
+        
         per_token_loss = -jnp.sum(
             labels * nnx.log_softmax(logits),
             axis=-1
@@ -558,9 +560,11 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         weighted_loss = loss_mask * timestep_weights * per_token_loss
         masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
 
-        mse_loss = jnp.mean((x_0 - predicted_x_0) ** 2)
+        # Compute MSE loss with proper scaling
+        mse_loss = jnp.mean((x_0 - predicted_x_0) ** 2) * jnp.sqrt(model.d_model)
 
-        total_loss = masked_loss + jnp.mean(router_loss) + mse_loss * 0.1
+        # Balance the losses
+        total_loss = masked_loss + jnp.mean(router_loss) + 0.5 * mse_loss
         
         return total_loss, (masked_loss, router_loss, mse_loss)
 
