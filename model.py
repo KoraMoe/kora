@@ -935,6 +935,13 @@ class DiffusionLLM(nnx.Module):
         
         self.final_norm = DyT(self.d_model, init_alpha=1.0, dtype=self.dtype, rngs=rngs)
 
+        # Add timestep embedding
+        self.timestep_embedding = nnx.Param(
+            init_fn(key, (self.timesteps, self.d_model)),
+            sharding=(None, None),
+            dtype=self.dtype,
+        )
+
         # Build noise schedule - cosine schedule instead of linear
         # Function to create cosine schedule following Improved DDPM paper
         def cosine_beta_schedule(timesteps, s=0.008):
@@ -1104,6 +1111,13 @@ class DiffusionLLM(nnx.Module):
         # Calculate dynamic attention mask based on timesteps
         # t shape: (batch, seq_len)
         # attn_mask shape: (batch, seq_len) - 1 for real tokens, 0 for padding
+        
+        # Add timestep embedding to the input
+        # Get timestep embeddings for each position
+        t_emb = jnp.take(self.timestep_embedding.value, t)  # shape: (batch, seq_len, d_model)
+        
+        # Add timestep embedding to the input
+        x = x + t_emb
         
         # Non-linear interpolation from 1.0 to 0.0 based on timestep
         # Use a sigmoid-based interpolation for more gradual attention reduction

@@ -638,7 +638,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         router_loss=router_loss
     )
 
-def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20):
+def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20, use_sliding_window: bool = False, window_size: int = 1, denoising_steps: int = 5):
     @nnx.jit
     def encode_input(model: DiffusionLLM, input_ids: jnp.ndarray):
         return model.encode(input_ids)
@@ -703,7 +703,64 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     x_t = jnp.where(prompt_mask[..., None], x_0, x_t)
     
     # Choose denoising approach
-    if use_ddim:
+    if use_sliding_window:
+        # Sliding window sampling
+        # First, calculate step size based on use_ddim
+        if use_ddim:
+            max_steps = ddim_steps
+            step_size = model.timesteps // ddim_steps
+        else:
+            max_steps = model.timesteps
+            step_size = 1
+            
+        # Calculate steps per token (how many denoising steps for each token)
+        steps_per_token = denoising_steps
+        
+        # Initialize window position (start after prompt)
+        window_pos = prompt_len
+        
+        # Continue until all tokens are fully denoised
+        while jnp.any(t > 0):
+            # Define the current window range
+            window_end = jnp.minimum(window_pos + window_size, seq_len)
+            
+            # Create a window mask (1 for tokens in current window, 0 otherwise)
+            window_indices = jnp.arange(seq_len)[None, :]  # shape: (1, seq_len)
+            window_mask = (window_indices >= window_pos) & (window_indices < window_end)
+            window_mask = jnp.tile(window_mask, (4, 1))  # Match batch size
+            
+            # Only reduce timesteps for tokens in the window
+            # Reduce by step_size × steps_per_token, but not below 0
+            step_reduction = step_size * steps_per_token
+            new_t = jnp.where(
+                window_mask & (t > 0),
+                jnp.maximum(0, t - step_reduction),
+                t
+            )
+            
+            # Create an active mask for tokens that need denoising (t > 0)
+            active_mask = (new_t > 0) | prompt_mask
+            
+            # Update timesteps
+            t = new_t
+            
+            # Apply denoising step
+            if use_ddim:
+                x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
+            else:
+                x_t = denoise_step_standard(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
+            
+            # If current window position is fully denoised, move window forward
+            # First, check if the first position in window is denoised
+            first_pos_in_window = t[:, window_pos]
+            if jnp.all(first_pos_in_window == 0):
+                window_pos += 1
+            
+            # Exit if window has processed all tokens
+            if window_pos >= seq_len:
+                break
+    
+    elif use_ddim:
         # DDIM sampling with fewer steps
         # Calculate step size for DDIM
         step_size = model.timesteps // ddim_steps
