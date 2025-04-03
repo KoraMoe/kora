@@ -1055,6 +1055,50 @@ class DiffusionLLM(nnx.Module):
         x_t_minus_1 = posterior_mean + noise_scale * noise
         
         return x_t_minus_1
+        
+    def denoise_ddim(self, x_t: jnp.ndarray, t: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> jnp.ndarray:
+        """
+        DDIM-style deterministic sampling.
+        
+        Args:
+            x_t: Noisy embeddings at timestep t, shape (batch_size, seq_len, d_model)
+            t: Current timestep, shape (batch_size, seq_len)
+            attn_mask: Optional attention mask
+            
+        Returns:
+            Denoised embeddings at timestep t-1
+        """
+        # Reshape t for broadcasting
+        t = t[..., None]  # shape: (batch_size, seq_len, 1)
+        
+        # Get parameters for each token's timestep
+        alpha_t = jnp.take(self.alphas.value, t)
+        alpha_cumprod_t = jnp.take(self.alphas_cumprod.value, t)
+        
+        # Predict x_0 directly
+        predicted_x_0, _ = self.__call__(x_t, t, attn_mask)
+        
+        # Quantize predicted_x_0 to the nearest token embedding
+        predicted_x_0 = self.clamp_embed(predicted_x_0)
+        
+        # DDIM deterministic sampling formula
+        # x_{t-1} = sqrt(alpha_{t-1}) * x_0 + sqrt(1 - alpha_{t-1}) * epsilon
+        # where epsilon is derived from x_t and predicted_x_0
+        
+        # Calculate epsilon from x_t and predicted_x_0
+        # x_t = sqrt(alpha_t) * x_0 + sqrt(1 - alpha_t) * epsilon
+        # Therefore: epsilon = (x_t - sqrt(alpha_t) * x_0) / sqrt(1 - alpha_t)
+        epsilon = (x_t - jnp.sqrt(alpha_cumprod_t) * predicted_x_0) / jnp.sqrt(1.0 - alpha_cumprod_t)
+        
+        # Get alpha_{t-1} for the previous timestep
+        # We need to handle the case where t=0, so we use a safe indexing approach
+        t_prev = jnp.maximum(0, t - 1)
+        alpha_cumprod_prev = jnp.take(self.alphas_cumprod.value, t_prev)
+        
+        # Apply DDIM formula
+        x_t_minus_1 = jnp.sqrt(alpha_cumprod_prev) * predicted_x_0 + jnp.sqrt(1.0 - alpha_cumprod_prev) * epsilon
+        
+        return x_t_minus_1
 
     def __call__(self, x: jnp.ndarray, t: jnp.ndarray, attn_mask: jnp.ndarray | None = None) -> tuple[jnp.ndarray, jnp.ndarray]:
         # Calculate dynamic attention mask based on timesteps
@@ -1069,8 +1113,10 @@ class DiffusionLLM(nnx.Module):
             # Use a more gradual decay function that preserves attention longer
             decay = 1.0 - jnp.tanh(2.0 * t_ratio)  # Slower falloff at the beginning
             
-            # Apply non-linear mask scaling
-            dynamic_mask = attn_mask * decay[..., None]
+            # Apply non-linear mask scaling - ensure shapes are compatible for broadcasting
+            # attn_mask: (batch, seq_len)
+            # decay: (batch, seq_len)
+            dynamic_mask = attn_mask * decay
         else:
             dynamic_mask = None
         
@@ -1162,10 +1208,13 @@ class Test():
     
     @staticmethod
     @nnx.jit
-    def test_diffusion_llm(module: DiffusionLLM, input_ids, rngs: nnx.Rngs, attention_mask: jnp.ndarray):
+    def test_diffusion_llm(module: DiffusionLLM, input_ids, rngs: nnx.Rngs, attention_mask: jnp.ndarray, use_ddim: bool = False):
         x = module.encode(input_ids)
         x_t, noise = module.noise(x, jnp.array([100]), rngs)
-        x_t_prev = module.denoise(x_t, jnp.array([99]), rngs, attn_mask=attention_mask)
+        if use_ddim:
+            x_t_prev = module.denoise_ddim(x_t, jnp.array([99]), attn_mask=attention_mask)
+        else:
+            x_t_prev = module.denoise(x_t, jnp.array([99]), rngs, attn_mask=attention_mask)
         logits = module.decode(x_t_prev)
         return logits
 
@@ -1246,9 +1295,16 @@ class Test():
             )
             try:
                 rngs = nnx.Rngs(params=jax.random.key(0))
+                # Test standard sampling
                 logits = self.test_diffusion_llm(self.diffusion_llm, input_ids, rngs, attention_mask=attention_mask)
-                print("Diffusion LLM output shape:", logits.shape)
+                print("Diffusion LLM output shape (standard sampling):", logits.shape)
                 print(logits)
+                
+                # Test DDIM sampling
+                logits_ddim = self.test_diffusion_llm(self.diffusion_llm, input_ids, rngs, attention_mask=attention_mask)
+                print("Diffusion LLM output shape (DDIM sampling):", logits_ddim.shape)
+                print(logits_ddim)
+                
                 results['Diffusion LLM'] = 'SUCCESS'
             except Exception as e:
                 print("Diffusion LLM error:", e)
