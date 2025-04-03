@@ -28,10 +28,10 @@ DATASET_CONFIG = {
 }
 
 MODEL_CONFIG = {
-    'd_model': 768,
-    'hidden_dim': 4096,
-    'num_layers': 16,
-    'num_heads': 16,
+    'd_model': 512,
+    'hidden_dim': 2048,
+    'num_layers': 8,
+    'num_heads': 8,
     'head_dim': 64,
     'vocab_size': VOCAB_SIZE,
     'num_experts': 4,
