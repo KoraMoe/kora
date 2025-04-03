@@ -559,14 +559,19 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
         # Apply loss mask and timestep weights, then compute mean loss
         weighted_loss = loss_mask * timestep_weights * per_token_loss
         masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
+        
+        # Calculate MSE loss with masking and weighting
+        mse_per_token = jnp.sum((predicted_x_0 - x_0) ** 2, axis=-1)  # Sum over embedding dimension
+        weighted_mse = loss_mask * timestep_weights * mse_per_token
+        mse_loss = jnp.sum(weighted_mse) / (jnp.sum(loss_mask) + 1e-8)
 
         # Balance the losses
-        total_loss = masked_loss + jnp.mean(router_loss)
+        total_loss = masked_loss + MSE_LOSS_WEIGHT * mse_loss + jnp.mean(router_loss)
         
-        return total_loss, (masked_loss, router_loss)
+        return total_loss, (masked_loss, mse_loss, router_loss)
 
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (total_loss, (x0_loss, router_loss)), grads = grad_fn(model)
+    (total_loss, (x0_loss, mse_loss, router_loss)), grads = grad_fn(model)
     
     # Update model parameters
     optimizer.update(grads)
@@ -575,6 +580,7 @@ def train_step(model: DiffusionLLM, optimizer: nnx.Optimizer, metrics: nnx.Multi
     metrics.update(
         total_loss=total_loss,
         x0_loss=x0_loss,
+        mse_loss=mse_loss,
         router_loss=router_loss,
     )
 
@@ -586,7 +592,7 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
 
     def loss_fn(model: DiffusionLLM):
         input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
+        attention_mask = batch['attention_mask']  # 1 for real tokens, 0 for padding
         batch_size = input_ids.shape[0]
         seq_len = input_ids.shape[1]
 
@@ -601,44 +607,56 @@ def eval_step(model: DiffusionLLM, metrics: nnx.MultiMetric, rngs: nnx.Rngs, bat
         x_0 = model.encode(input_ids)
         x_t, _ = model.noise(x_0, t, rngs)
 
-        # Model now predicts x_0 directly, matching training
+        # Model now predicts x_0 directly
         predicted_x_0, router_loss = model(x_t, t, attn_mask=attention_mask)
         
         # Decode predicted x_0 to get logits over vocabulary
         logits = model.decode(predicted_x_0)  # shape: [batch_size, seq_len, vocab_size]
+
+        # Create a mask for valid tokens
+        loss_mask = attention_mask
         
-        # Create loss mask: 1 for t > 0 and valid tokens, 0 for t = 0 or padding
-        loss_mask = (t > 0).astype(logits.dtype) * attention_mask
-        
-        # Apply timestep-based weighting
+        # Create timestep-based weights (more balanced weighting)
         t_normalized = t.astype(logits.dtype) / model.timesteps
-        timestep_weights = 1.0 + 2.0 * t_normalized  # Linear weighting from 1.0 to 3.0
+        # Use a smoother weighting function that doesn't over-emphasize later timesteps
+        timestep_weights = 1.0 + t_normalized  # Linear weighting from 1.0 to 2.0
         
-        # Compute cross entropy loss using one-hot labels
+        # Compute cross entropy loss with label smoothing
         labels = nnx.one_hot(input_ids, num_classes=logits.shape[-1])
+        # Add label smoothing
+        label_smoothing = 0.1
+        labels = (1.0 - label_smoothing) * labels + label_smoothing / labels.shape[-1]
+        
         per_token_loss = -jnp.sum(
             labels * nnx.log_softmax(logits),
             axis=-1
         )
         
-        # Apply loss mask and compute weighted mean loss
+        # Apply loss mask and timestep weights, then compute mean loss
         weighted_loss = loss_mask * timestep_weights * per_token_loss
         masked_loss = jnp.sum(weighted_loss) / (jnp.sum(loss_mask) + 1e-8)
-
-        total_loss = masked_loss + jnp.mean(router_loss)
         
-        return total_loss, (masked_loss, router_loss)
+        # Calculate MSE loss with masking and weighting
+        mse_per_token = jnp.sum((predicted_x_0 - x_0) ** 2, axis=-1)  # Sum over embedding dimension
+        weighted_mse = loss_mask * timestep_weights * mse_per_token
+        mse_loss = jnp.sum(weighted_mse) / (jnp.sum(loss_mask) + 1e-8)
+
+        # Balance the losses
+        total_loss = masked_loss + MSE_LOSS_WEIGHT * mse_loss + jnp.mean(router_loss)
+        
+        return total_loss, (masked_loss, mse_loss, router_loss)
     
-    total_loss, (x0_loss, router_loss) = loss_fn(model)
+    total_loss, (x0_loss, mse_loss, router_loss) = loss_fn(model)
     
     # Update metrics
     metrics.update(
         total_loss=total_loss,
         x0_loss=x0_loss,
+        mse_loss=mse_loss,
         router_loss=router_loss
     )
 
-def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20, use_sliding_window: bool = True, window_size: int = 2, denoising_steps: int = 5):
+def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me", seq_len: int = 32, rngs: nnx.Rngs = nnx.Rngs(0), use_ddim: bool = True, ddim_steps: int = 20):
     @nnx.jit
     def encode_input(model: DiffusionLLM, input_ids: jnp.ndarray):
         return model.encode(input_ids)
@@ -702,65 +720,7 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     # Only use noise for non-prompt positions
     x_t = jnp.where(prompt_mask[..., None], x_0, x_t)
     
-    # Choose denoising approach
-    if use_sliding_window:
-        # Sliding window sampling
-        # First, calculate step size based on use_ddim
-        if use_ddim:
-            max_steps = ddim_steps
-            step_size = model.timesteps // ddim_steps
-        else:
-            max_steps = model.timesteps
-            step_size = 1
-            
-        # Calculate steps per token (how many denoising steps for each token)
-        steps_per_token = denoising_steps
-        
-        # Initialize window position (start after prompt)
-        window_pos = prompt_len
-        
-        # Continue until all tokens are fully denoised
-        while jnp.any(t > 0):
-            # Define the current window range
-            window_end = jnp.minimum(window_pos + window_size, seq_len)
-            
-            # Create a window mask (1 for tokens in current window, 0 otherwise)
-            window_indices = jnp.arange(seq_len)[None, :]  # shape: (1, seq_len)
-            window_mask = (window_indices >= window_pos) & (window_indices < window_end)
-            window_mask = jnp.tile(window_mask, (4, 1))  # Match batch size
-            
-            # Only reduce timesteps for tokens in the window
-            # Reduce by step_size × steps_per_token, but not below 0
-            step_reduction = step_size * steps_per_token
-            new_t = jnp.where(
-                window_mask & (t > 0),
-                jnp.maximum(0, t - step_reduction),
-                t
-            )
-            
-            # Create an active mask for tokens that need denoising (t > 0)
-            active_mask = (new_t > 0) | prompt_mask
-            
-            # Update timesteps
-            t = new_t
-            
-            # Apply denoising step
-            if use_ddim:
-                x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
-            else:
-                x_t = denoise_step_standard(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
-            
-            # If current window position is fully denoised, move window forward
-            # First, check if the first position in window is denoised
-            first_pos_in_window = t[:, window_pos]
-            if jnp.all(first_pos_in_window == 0):
-                window_pos += 1
-            
-            # Exit if window has processed all tokens
-            if window_pos >= seq_len:
-                break
-    
-    elif use_ddim:
+    if use_ddim:
         # DDIM sampling with fewer steps
         # Calculate step size for DDIM
         step_size = model.timesteps // ddim_steps
@@ -879,12 +839,14 @@ def main():
         train_metrics = nnx.MultiMetric(
             total_loss=nnx.metrics.Average('total_loss'),
             x0_loss=nnx.metrics.Average('x0_loss'),
+            mse_loss=nnx.metrics.Average('mse_loss'),
             router_loss=nnx.metrics.Average('router_loss'),
         )
         
         eval_metrics = nnx.MultiMetric(
             total_loss=nnx.metrics.Average('total_loss'),
             x0_loss=nnx.metrics.Average('x0_loss'),
+            mse_loss=nnx.metrics.Average('mse_loss'),
             router_loss=nnx.metrics.Average('router_loss')
         )
 
@@ -914,6 +876,7 @@ def main():
                 progress_bar.set_postfix({
                     'loss': f"{metrics_values['total_loss']:.4f}",
                     'x0_loss': f"{metrics_values['x0_loss']:.4f}",
+                    'mse_loss': f"{metrics_values['mse_loss']:.4f}",
                     'lr': f"{lr_schedule(step):.6f}"
                 })
 
