@@ -586,7 +586,7 @@ def load_checkpoint(
                     
                     # Update the model with the sharded state
                     nnx.update(model, sharded_state)
-                
+                '''
                 # Restore batch loader state if provided
                 if batch_loader is not None and "batch_state" in checkpoint_data:
                     try:
@@ -628,6 +628,7 @@ def load_checkpoint(
                         batch_loader.current_idx = 0
                         batch_loader.indices = np.random.RandomState(seed=batch_loader.base_seed).permutation(batch_loader.num_samples)
                         batch_loader._start_producer_thread()
+                '''
                 
                 print(f"Successfully loaded checkpoint from step {step}")
                 return step
