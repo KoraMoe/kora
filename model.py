@@ -916,7 +916,7 @@ class DiffusionLLM(nnx.Module):
                 training=self.training,
                 use_gradient_checkpointing=self.use_gradient_checkpointing,
                 need_attention_mask=self.need_attention_mask,
-                is_causal=False,
+                is_causal=True,
                 init_fn=init_fn,
                 layer_idx=layer_idx,
                 rngs=rngs
