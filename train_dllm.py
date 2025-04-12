@@ -666,20 +666,18 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
         return model.noise(x, t, rngs)
 
     @nnx.jit
-    def denoise_step(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, x_0: jnp.ndarray):
-        # Denoise
-        # The attention_mask should have shape (batch, seq_len) for the model's __call__ method
-        # No need to add an extra dimension
+    def denoise_step(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, decoding_mask: jnp.ndarray, x_0: jnp.ndarray):
+        # Denoise with DDIM
         new_x = model.denoise_ddim(x_t, t, attn_mask=attention_mask)
-        # Keep prompt tokens unchanged
-        return jnp.where(prompt_mask[..., None], x_0, new_x)
+        # Keep prompt tokens and already decoded tokens unchanged
+        return jnp.where((prompt_mask | decoding_mask)[..., None], x_0, new_x)
 
     @nnx.jit
-    def denoise_step_standard(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, x_0: jnp.ndarray):
+    def denoise_step_standard(model: DiffusionLLM, x_t: jnp.ndarray, t: jnp.ndarray, rngs: nnx.Rngs, attention_mask: jnp.ndarray, prompt_mask: jnp.ndarray, decoding_mask: jnp.ndarray, x_0: jnp.ndarray):
         # Standard denoising with stochastic sampling
         new_x = model.denoise(x_t, t, rngs, attn_mask=attention_mask)
-        # Keep prompt tokens unchanged
-        return jnp.where(prompt_mask[..., None], x_0, new_x)
+        # Keep prompt tokens and already decoded tokens unchanged
+        return jnp.where((prompt_mask | decoding_mask)[..., None], x_0, new_x)
 
     @nnx.jit
     def decode_output(model: DiffusionLLM, x_t: jnp.ndarray):
@@ -699,56 +697,69 @@ def sample_text(model: DiffusionLLM, tokenizer, prompt: str = "Can you tell me",
     prompt_mask = jnp.zeros((1, seq_len), dtype=jnp.bool_)
     prompt_mask = prompt_mask.at[:, :prompt_len].set(True)
     
+    # Create decoding mask (1 for already decoded tokens, 0 for tokens to decode)
+    decoding_mask = jnp.zeros((1, seq_len), dtype=jnp.bool_)
+    
     # Pad the batch dimension to match data parallel size (4)
     input_ids = jnp.tile(padded_input_ids, (4, 1))
     prompt_mask = jnp.tile(prompt_mask, (4, 1))
-    attention_mask = jnp.ones_like(input_ids)  # All ones for full attention
+    decoding_mask = jnp.tile(decoding_mask, (4, 1))
     
     # Encode prompt
     x_0 = encode_input(model, input_ids)
     
-    # Initialize timesteps - 0 for prompt, max timestep for noise tokens
+    # Initialize timesteps - 0 for prompt and decoded tokens, max timestep for noise tokens
     t = jnp.where(
-        prompt_mask,
+        prompt_mask | decoding_mask,
         jnp.zeros_like(input_ids),
         jnp.full_like(input_ids, model.timesteps - 1)
     )
     
-    # Add noise only to non-prompt positions
+    # Add noise only to non-prompt and non-decoded positions
     x_t, _ = add_noise(model, x_0, t, rngs)
+    x_t = jnp.where((prompt_mask | decoding_mask)[..., None], x_0, x_t)
     
-    # Only use noise for non-prompt positions
-    x_t = jnp.where(prompt_mask[..., None], x_0, x_t)
-    
-    if use_ddim:
-        # DDIM sampling with fewer steps
-        # Calculate step size for DDIM
-        step_size = model.timesteps // ddim_steps
+    # Generate tokens sequentially
+    for pos in range(prompt_len, seq_len):
+        # Update attention mask to prevent attending to future tokens
+        attention_mask = jnp.tril(jnp.ones((1, seq_len, seq_len), dtype=jnp.bool_))
+        attention_mask = jnp.tile(attention_mask, (4, 1, 1))
         
-        # Denoise step by step with DDIM
-        for i in range(ddim_steps - 1, -1, -1):
-            # Calculate current timestep
-            current_t = i * step_size
+        if use_ddim:
+            # DDIM sampling with fewer steps
+            step_size = model.timesteps // ddim_steps
             
-            # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
-            t = jnp.where(
-                prompt_mask,
-                jnp.zeros_like(input_ids),
-                jnp.full_like(input_ids, current_t)
-            )
-            x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
-    else:
-        # Standard denoising with all timesteps
-        for timestep in range(model.timesteps - 1, -1, -1):
-            # Set timestep - keep 0 for prompt tokens, current timestep for noise tokens
-            t = jnp.where(
-                prompt_mask,
-                jnp.zeros_like(input_ids),
-                jnp.full_like(input_ids, timestep)
-            )
-            x_t = denoise_step_standard(model, x_t, t, rngs, attention_mask, prompt_mask, x_0)
+            for i in range(ddim_steps - 1, -1, -1):
+                current_t = i * step_size
+                t = jnp.where(
+                    prompt_mask | decoding_mask,
+                    jnp.zeros_like(input_ids),
+                    jnp.full_like(input_ids, current_t)
+                )
+                x_t = denoise_step(model, x_t, t, rngs, attention_mask, prompt_mask, decoding_mask, x_0)
+        else:
+            # Standard denoising with all timesteps
+            for timestep in range(model.timesteps - 1, -1, -1):
+                t = jnp.where(
+                    prompt_mask | decoding_mask,
+                    jnp.zeros_like(input_ids),
+                    jnp.full_like(input_ids, timestep)
+                )
+                x_t = denoise_step_standard(model, x_t, t, rngs, attention_mask, prompt_mask, decoding_mask, x_0)
+        
+        # Decode the current position
+        generated_ids = decode_output(model, x_t)
+        
+        # Update decoding mask for the current position
+        decoding_mask = decoding_mask.at[:, pos].set(True)
+        
+        # Update x_0 with the newly generated token
+        x_0 = encode_input(model, generated_ids)
+        
+        # Update x_t to include the newly generated token
+        x_t = jnp.where(decoding_mask[..., None], x_0, x_t)
     
-    # Decode to tokens
+    # Final decode to get all tokens
     generated_ids = decode_output(model, x_t)
     
     # Only take the first sequence since we tiled the input
