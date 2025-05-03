@@ -7,10 +7,10 @@ import msgpack
 from flax import nnx
 from transformers import AutoTokenizer
 import argparse
+from typing import Optional
 
 from config import *
 from model import LLM
-from train_llm import make_mesh, load_checkpoint
 
 @nnx.jit
 def _model_generate_step(model: LLM, padded_ids: jnp.ndarray, attention_mask: jnp.ndarray):
@@ -99,10 +99,150 @@ def generate_text(model: LLM, tokenizer, prompt: str = "Can you tell me", max_ne
     
     return generated_text
 
-def setup_inference_model(checkpoint_path=None):
+def load_checkpoint_for_inference(
+    mesh: jax.sharding.Mesh,
+    model: LLM,
+    checkpoint_path: Optional[str] = None
+) -> int:
+    """
+    Load a checkpoint directly from a specified path for inference.
+    If no path is specified, try to find the latest checkpoint in CHECKPOINT_DIR.
+    
+    Args:
+        mesh: JAX mesh for model distribution
+        model: The model to load the checkpoint into
+        checkpoint_path: Direct path to the checkpoint file (.msgpack)
+        
+    Returns:
+        The step number of the loaded checkpoint, or 0 if none was loaded
+    """
+    # If checkpoint_path is provided, use it directly
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        try:
+            # Load checkpoint data using msgpack
+            with open(checkpoint_path, "rb") as f:
+                try:
+                    checkpoint_data = msgpack.unpackb(f.read(), raw=False, strict_map_key=False)
+                except (ValueError, msgpack.exceptions.UnpackException) as e:
+                    print(f"Failed to unpack checkpoint {checkpoint_path}: {str(e)}")
+                    return 0
+            
+            # Convert structured arrays back to appropriate types
+            def convert_from_msgpack(obj):
+                if isinstance(obj, dict):
+                    # Check if this is a serialized array
+                    if "__jax_array__" in obj:
+                        # Handle the case where array data might be None due to serialization issues
+                        if obj["data"] is None:
+                            print(f"Warning: Found array with missing data. Error: {obj.get('error', 'Unknown')}")
+                            # Create an empty array with the right shape and dtype if possible
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                # If we don't have shape info, return a scalar zero
+                                return jnp.array(0, dtype=dtype_str)
+                        # Normal case - convert back to JAX array
+                        try:
+                            array_data = np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                            return jnp.array(array_data)
+                        except Exception as array_error:
+                            print(f"Error converting array: {array_error}")
+                            # Fallback to zeros with appropriate shape
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return jnp.zeros(shape, dtype=dtype_str)
+                            else:
+                                return jnp.array(0, dtype=dtype_str)
+                    elif "__numpy_array__" in obj:
+                        # Convert back to NumPy array
+                        try:
+                            return np.array(obj["data"], dtype=obj["dtype"]).reshape(obj["shape"])
+                        except Exception as np_error:
+                            print(f"Error converting numpy array: {np_error}")
+                            shape = obj.get("shape")
+                            dtype_str = obj.get("dtype", "float32")
+                            if shape is not None:
+                                return np.zeros(shape, dtype=dtype_str)
+                            else:
+                                return np.array(0, dtype=dtype_str)
+                    else:
+                        # Regular dictionary
+                        return {k: convert_from_msgpack(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_from_msgpack(item) for item in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(convert_from_msgpack(item) for item in obj)
+                else:
+                    return obj
+            
+            try:
+                # Create abstract model state
+                model_state = nnx.state(model)
+                # Get the named sharding for the model based on the mesh
+                named_sharding = nnx.get_named_sharding(model_state, mesh)
+
+                # Process model state
+                model_state_dict = convert_from_msgpack(checkpoint_data["model_state"])
+
+                # Ensure we have a dictionary type for the state
+                if not isinstance(model_state_dict, dict):
+                    raise TypeError(f"Expected model_state_dict to be a dictionary, got {type(model_state_dict)}")
+
+                # Replace abstract state with restored state
+                nnx.replace_by_pure_dict(model_state, model_state_dict)
+
+                # Apply sharding constraints to the state to ensure it's properly distributed
+                with mesh:
+                    # Use jax.device_put with tree_map to apply sharding to each array in the state
+                    sharded_state = jax.tree.map(
+                        lambda x, s: jax.device_put(x, s) if isinstance(x, jnp.ndarray) else x,
+                        model_state, named_sharding
+                    )
+                    
+                    # Update the model with the sharded state
+                    nnx.update(model, sharded_state)
+                
+                # Get the step from the checkpoint data
+                step = checkpoint_data.get("step", 0)
+                print(f"Successfully loaded checkpoint from {checkpoint_path}, step {step}")
+                return step
+                
+            except Exception as e:
+                print(f"Error processing checkpoint {checkpoint_path}: {str(e)}")
+                return 0
+                
+        except Exception as e:
+            print(f"Error opening checkpoint file {checkpoint_path}: {str(e)}")
+            return 0
+    
+    # If no direct path or it doesn't exist, try to find the latest checkpoint in CHECKPOINT_DIR
+    else:
+        checkpoint_dir = CHECKPOINT_DIR  # Use the default from config
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith("checkpoint_") and f.endswith(".msgpack")]
+        
+        if not checkpoint_files:
+            print(f"No checkpoint found in {checkpoint_dir}, starting from scratch")
+            return 0
+        
+        # Extract step numbers from filenames and find the latest
+        steps = [int(f.split("_")[1].split(".")[0]) for f in checkpoint_files]
+        steps.sort(reverse=True)  # Sort in descending order to try newest first
+        
+        latest_step = steps[0]
+        latest_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{latest_step}.msgpack")
+        print(f"Found latest checkpoint: {latest_checkpoint_path}")
+        
+        # Call the function recursively with the specific path
+        return load_checkpoint_for_inference(mesh, model, latest_checkpoint_path)
+
+def setup_inference_model(checkpoint_path):
     """Set up the model for inference and load a checkpoint if specified."""
     print("TOTAL DEVICES:", jax.device_count())
-    mesh = make_mesh()
+    mesh = jax.make_mesh([1, 1], ["data", "expert"])
     
     with mesh:
         # Set model config to inference mode
@@ -114,25 +254,12 @@ def setup_inference_model(checkpoint_path=None):
         model = LLM(**inference_config, rngs=nnx.Rngs(0))
         print(f"\nCreated model for inference")
         
-        # If a specific checkpoint is provided, load it
-        if checkpoint_path:
-            if os.path.exists(checkpoint_path):
-                print(f"Loading checkpoint from {checkpoint_path}")
-                # Call the same checkpoint loading function used in training
-                global CHECKPOINT_DIR
-                original_checkpoint_dir = CHECKPOINT_DIR
-                # Temporarily override checkpoint directory to use the specified file's dir
-                CHECKPOINT_DIR = os.path.dirname(checkpoint_path)
-                step = load_checkpoint(mesh, model)
-                # Restore original checkpoint directory
-                CHECKPOINT_DIR = original_checkpoint_dir
-                print(f"Loaded checkpoint from step {step}")
-            else:
-                print(f"Warning: Checkpoint {checkpoint_path} not found. Using uninitialized model.")
+        # Load the checkpoint
+        step = load_checkpoint_for_inference(mesh, model, checkpoint_path)
+        if step > 0:
+            print(f"Model loaded from checkpoint at step {step}")
         else:
-            # Load the latest checkpoint
-            step = load_checkpoint(mesh, model)
-            print(f"Loaded checkpoint from step {step}")
+            print("Warning: No checkpoint loaded. Using uninitialized model.")
             
         return model, mesh
 
